@@ -39,5 +39,5 @@ Behaviour aimed at a caller that cannot see the data itself:
 - Error codes distinguish `PASSWORD_REQUIRED` from `INVALID_PASSWORD`, and name
   the available sheets or columns so a caller can correct itself in one step.
 
-[Unreleased]: https://github.com/henryyu/xlpeek/compare/v1.0.1...HEAD
-[1.0.1]: https://github.com/henryyu/xlpeek/releases/tag/v1.0.1
+[Unreleased]: https://github.com/jbeetle/xlpeek/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/jbeetle/xlpeek/releases/tag/v1.0.1

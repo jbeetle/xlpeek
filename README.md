@@ -1,7 +1,7 @@
 # xlpeek
 
-[![ci](https://github.com/henryyu/xlpeek/actions/workflows/ci.yml/badge.svg)](https://github.com/henryyu/xlpeek/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/henryyu/xlpeek.svg)](https://pkg.go.dev/github.com/henryyu/xlpeek)
+[![ci](https://github.com/jbeetle/xlpeek/actions/workflows/ci.yml/badge.svg)](https://github.com/jbeetle/xlpeek/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/jbeetle/xlpeek.svg)](https://pkg.go.dev/github.com/jbeetle/xlpeek)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 **Give an agent a spreadsheet without giving it your whole context window.**
@@ -29,7 +29,7 @@ a workbook. If that is not what you want, you want
 ## Install
 
 ```bash
-go install github.com/henryyu/xlpeek@latest
+go install github.com/jbeetle/xlpeek@latest
 ```
 
 Or build from source (Go 1.25+):

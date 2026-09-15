@@ -1,4 +1,4 @@
-module github.com/henryyu/xlpeek
+module github.com/jbeetle/xlpeek
 
 go 1.25.0
 

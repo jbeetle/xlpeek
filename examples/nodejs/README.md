@@ -1,6 +1,6 @@
 # xlpeek for Node.js
 
-A wrapper around [xlpeek](https://github.com/henryyu/xlpeek) for Node agents, plus the tests that pin down
+A wrapper around [xlpeek](https://github.com/jbeetle/xlpeek) for Node agents, plus the tests that pin down
 the three stdio traps it exists to avoid. Every number below was measured, and
 `node test.js` re-measures them.
 
