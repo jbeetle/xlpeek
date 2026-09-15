@@ -1,0 +1,880 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/xuri/excelize/v2"
+)
+
+// evalWith parses expr and evaluates it against a map of variables.
+func evalWith(t *testing.T, expr string, vars map[string]float64) (float64, bool) {
+	t.Helper()
+	node, err := parseExpr(expr)
+	if err != nil {
+		t.Fatalf("parseExpr(%q): %v", expr, err)
+	}
+	return node.eval(func(name string) (float64, bool) {
+		v, ok := vars[name]
+		return v, ok
+	})
+}
+
+func TestParseExprArithmetic(t *testing.T) {
+	vars := map[string]float64{"a": 10, "b": 3, "收入": 100, "成本": 40}
+	cases := []struct {
+		expr string
+		want float64
+		ok   bool
+	}{
+		{expr: "1+2*3", want: 7, ok: true},   // multiplication binds tighter
+		{expr: "(1+2)*3", want: 9, ok: true}, // parentheses override
+		{expr: "a-b", want: 7, ok: true},
+		{expr: "收入-成本", want: 60, ok: true},
+		{expr: "收入/4", want: 25, ok: true},
+		{expr: "-5", want: -5, ok: true},
+		{expr: "-a+2", want: -8, ok: true},
+		{expr: "2*3+4*5", want: 26, ok: true},
+		{expr: "1-2-3", want: -4, ok: true},    // left associative
+		{expr: "a/0", ok: false},               // division by zero yields no value
+		{expr: "missing+1", want: 1, ok: true}, // an absent operand counts as zero
+		{expr: "missing", ok: false},           // ...but a bare one stays absent
+		{expr: "missing*收入", want: 0, ok: true},
+	}
+	for _, tc := range cases {
+		got, ok := evalWith(t, tc.expr, vars)
+		if ok != tc.ok {
+			t.Errorf("eval(%q) present = %v, want %v", tc.expr, ok, tc.ok)
+			continue
+		}
+		if ok && math.Abs(got-tc.want) > 1e-9 {
+			t.Errorf("eval(%q) = %v, want %v", tc.expr, got, tc.want)
+		}
+	}
+}
+
+// A column name may start with a digit; scanning the whole operand before
+// deciding whether it is a number keeps "2023年收入" from being read as 2023.
+func TestParseExprIdentifierStartingWithDigit(t *testing.T) {
+	if _, ok := evalWith(t, "2023", map[string]float64{}); !ok {
+		t.Error("a bare number should evaluate")
+	}
+	vars := map[string]float64{"2023年收入": 500}
+	if got, ok := evalWith(t, "2023年收入", vars); !ok || got != 500 {
+		t.Errorf("eval(2023年收入) = %v, %v; want 500, true", got, ok)
+	}
+	if got, ok := evalWith(t, "2023年收入*2", vars); !ok || got != 1000 {
+		t.Errorf("eval(2023年收入*2) = %v, %v; want 1000, true", got, ok)
+	}
+}
+
+// A name containing an operator has to be escapable, or it can never be used.
+func TestParseExprBracketedName(t *testing.T) {
+	vars := map[string]float64{"收入-成本": 60, "净 利": 25}
+	if got, ok := evalWith(t, "[收入-成本]", vars); !ok || got != 60 {
+		t.Errorf("eval([收入-成本]) = %v, %v; want 60, true", got, ok)
+	}
+	if got, ok := evalWith(t, "[净 利]/5", vars); !ok || got != 5 {
+		t.Errorf("eval([净 利]/5) = %v, %v; want 5, true", got, ok)
+	}
+}
+
+func TestParseExprErrors(t *testing.T) {
+	for _, expr := range []string{"", "1+", "(1+2", "1)", "[abc", "[]", "1 2"} {
+		if _, err := parseExpr(expr); err == nil {
+			t.Errorf("parseExpr(%q) should fail", expr)
+		}
+	}
+}
+
+func TestIdentifiersAreCollected(t *testing.T) {
+	node, err := parseExpr("(a+b)*c-2023")
+	if err != nil {
+		t.Fatalf("parseExpr: %v", err)
+	}
+	seen := map[string]bool{}
+	identifiers(node, seen)
+	for _, want := range []string{"a", "b", "c"} {
+		if !seen[want] {
+			t.Errorf("identifiers missed %q, got %v", want, seen)
+		}
+	}
+	if seen["2023"] {
+		t.Error("a numeric literal should not be reported as an identifier")
+	}
+}
+
+// Plain addition drifts over thousands of terms; the compensation is what keeps
+// a revenue total from coming out as ...24999 instead of ...25.
+func TestCompensatedSumBeatsNaive(t *testing.T) {
+	var compensated compensatedSum
+	var naive float64
+	for i := 0; i < 10000; i++ {
+		compensated.add(0.1)
+		naive += 0.1
+	}
+	if got := compensated.value(); math.Abs(got-1000) > 1e-9 {
+		t.Errorf("compensatedSum = %v, want 1000", got)
+	}
+	if math.Abs(naive-1000) < 1e-9 {
+		t.Skip("naive summation happened to be exact here")
+	}
+	if math.Abs(compensated.value()-1000) >= math.Abs(naive-1000) {
+		t.Errorf("compensation did not improve accuracy: compensated=%v naive=%v",
+			compensated.value(), naive)
+	}
+}
+
+func TestRoundToExcel(t *testing.T) {
+	cases := []struct {
+		in   float64
+		want float64
+	}{
+		// Sixteen significant digits collapse to fifteen.
+		{in: 420940492.1000002, want: 420940492.1},
+		// Fifteen significant digits are already inside Excel's precision, so
+		// this is deliberately left alone. Rounding here cannot rescue a
+		// drifted total; compensated summation is what prevents the drift.
+		{in: 2839456194.24999, want: 2839456194.24999},
+		{in: 0, want: 0},
+		{in: 375, want: 375},
+	}
+	for _, tc := range cases {
+		if got := roundToExcel(tc.in); got != tc.want {
+			t.Errorf("roundToExcel(%v) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+	if got := roundToExcel(math.NaN()); !math.IsNaN(got) {
+		t.Errorf("roundToExcel(NaN) = %v, want NaN", got)
+	}
+}
+
+func TestTSVField(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{in: "abc", want: "abc"},
+		{in: "2024-01-01", want: "2024-01-01"},
+		// Remark columns routinely carry tabs and newlines; flattening those
+		// silently would corrupt the data, so they are quoted as CSV does.
+		{in: "a\tb", want: "\"a\tb\""},
+		{in: "a\nb", want: "\"a\nb\""},
+		{in: "say \"hi\"", want: "\"say \"\"hi\"\"\""},
+	}
+	for _, tc := range cases {
+		if got := tsvField(tc.in); got != tc.want {
+			t.Errorf("tsvField(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestBuildTSV(t *testing.T) {
+	got := buildTSV([]string{"a", "b"}, [][]string{{"1", "2"}, {"3", "4"}})
+	const want = "a\tb\n1\t2\n3\t4\n"
+	if got != want {
+		t.Errorf("buildTSV = %q, want %q", got, want)
+	}
+}
+
+// Two output fields sharing a name would emit the same JSON key twice, and a
+// parser keeps only the last copy — a total of 2,839,456,194.25 silently
+// becomes 1. The check has to reject that rather than let it through.
+func TestValidateUniqueFields(t *testing.T) {
+	if err := validateUniqueFields([]string{"sum_收入金额", "count", "毛利率"}); err != nil {
+		t.Errorf("distinct names should be accepted, got %v", err)
+	}
+	err := validateUniqueFields([]string{"sum_收入金额", "count", "sum_收入金额"})
+	if err == nil {
+		t.Fatal("duplicate names should be rejected")
+	}
+	if !strings.Contains(err.Error(), "sum_收入金额") {
+		t.Errorf("error should name the offender, got %q", err)
+	}
+	if !strings.Contains(err.Error(), "name=expression") {
+		t.Errorf("error should say how to fix it, got %q", err)
+	}
+}
+
+// The same hazard in read: projecting one column twice must not produce two
+// identical object keys.
+func TestProjectedHeaderKeysAreUnique(t *testing.T) {
+	names := []string{"收入金额", "收入金额"}
+	got := headerKeys(names, len(names))
+	if len(got) != 2 || got[0] == got[1] {
+		t.Fatalf("projected keys must be unique, got %v", got)
+	}
+	row := orderedRow{keys: got, vals: []any{"1", "2"}}
+	const want = `{"收入金额":"1","收入金额_2":"2"}`
+	if rendered := marshalLikeCLI(t, row); rendered != want {
+		t.Errorf("Marshal = %s, want %s", rendered, want)
+	}
+}
+
+// The comparability check only shouts about a column whose name reads like a
+// unit, currency or basis. These cases pin down where that line sits, because
+// a false positive trains a caller to ignore the warning and a false negative
+// lets a meaningless total through unremarked.
+func TestIsHazardName(t *testing.T) {
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{name: "单位", want: true},
+		{name: "金额单位", want: true},
+		{name: "币种", want: true},
+		{name: "本位币", want: true},
+		{name: "期末汇率", want: true},
+		{name: "口径", want: true},
+		{name: "unit", want: true},
+		{name: "unit_price", want: true},
+		{name: "Currency", want: true},
+		{name: "exchange_rate", want: true},
+		// Substring matches must not fire inside unrelated English words.
+		{name: "opportunity", want: false},
+		{name: "corporate", want: false},
+		{name: "销售区域", want: false},
+		{name: "客户名称", want: false},
+		{name: "", want: false},
+	}
+	for _, tc := range cases {
+		if got := isHazardName(tc.name); got != tc.want {
+			t.Errorf("isHazardName(%q) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A column with a single value cannot make a total incomparable, and one with
+// hundreds of values is an identifier rather than a dimension; neither belongs
+// in the report.
+func TestBuildUnaccountedReport(t *testing.T) {
+	tracked := map[int]*unaccountedColumn{
+		0: {name: "单位", counts: map[string]int{"元": 2103, "千元": 597}},
+		1: {name: "产品线", counts: map[string]int{"A": 5, "B": 3}},
+		2: {name: "备注", counts: map[string]int{"关联方": 86}},             // single value
+		3: {name: "凭证号", counts: map[string]int{"a": 1}, capped: true}, // too many
+	}
+	report := buildUnaccountedReport(tracked)
+	if len(report) != 2 {
+		t.Fatalf("report = %+v, want only 单位 and 产品线", report)
+	}
+	if report[0].Column != "单位" || !report[0].Suspected {
+		t.Errorf("the unit column must sort first and be flagged: %+v", report[0])
+	}
+	if report[1].Column != "产品线" || report[1].Suspected {
+		t.Errorf("an ordinary dimension must be listed but not flagged: %+v", report[1])
+	}
+	if got := report[0].Sample; len(got) != 2 || got[0] != "元" {
+		t.Errorf("sample should be the most frequent first, got %v", got)
+	}
+}
+
+// A file that cannot be opened has to be classified well enough that the
+// caller knows what to do. Handing back the raw "zip: not a valid zip file"
+// for an encrypted workbook sends the caller looking for corruption instead of
+// asking for a password.
+func TestSniffFile(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name string, head []byte) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, head, 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return path
+	}
+	cases := []struct {
+		name string
+		path string
+		want fileKind
+	}{
+		{name: "ole", path: write("enc.xlsx",
+			[]byte{0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1, 0, 0}), want: kindOLE},
+		{name: "zip", path: write("book.xlsx",
+			[]byte{'P', 'K', 0x03, 0x04, 0, 0, 0, 0}), want: kindPackage},
+		{name: "empty zip", path: write("empty.xlsx",
+			[]byte{'P', 'K', 0x05, 0x06, 0, 0, 0, 0}), want: kindPackage},
+		{name: "png", path: write("pic.png",
+			[]byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}), want: kindOther},
+		{name: "too short", path: write("tiny", []byte{'P', 'K'}), want: kindOther},
+		{name: "missing", path: filepath.Join(dir, "nope"), want: kindOther},
+	}
+	for _, tc := range cases {
+		if got := sniffFile(tc.path); got != tc.want {
+			t.Errorf("sniffFile(%s) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// The derived errors must reach the caller as codes they can branch on.
+func TestDerivedErrorCodes(t *testing.T) {
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{err: errPasswordRequired, want: codePasswordRequired},
+		{err: errNotSpreadsheet, want: codeBadFormat},
+		{err: excelize.ErrWorkbookPassword, want: codeInvalidPassword},
+		{err: excelize.ErrWorkbookFileFormat, want: codeBadFormat},
+		{err: excelize.ErrSheetNotExist{SheetName: "x"}, want: codeSheetNotFound},
+		{err: errors.New("something else"), want: codeRead},
+	}
+	for _, tc := range cases {
+		if got, _ := classify(tc.err); got != tc.want {
+			t.Errorf("classify(%v) = %q, want %q", tc.err, got, tc.want)
+		}
+	}
+}
+
+// withSession takes over the package-level session state so a test can drive
+// the cache, and puts everything back afterwards.
+func withSession(t *testing.T, limit int, body func()) {
+	t.Helper()
+	saved := struct {
+		enabled  bool
+		books    []workbookEntry
+		limit    int
+		started  time.Time
+		requests int
+	}{sessionEnabled, sessionWorkbooks, sessionCacheLimit, sessionStarted, sessionRequests}
+	defer func() {
+		closeSessionWorkbooks()
+		sessionEnabled, sessionWorkbooks = saved.enabled, saved.books
+		sessionCacheLimit, sessionStarted, sessionRequests = saved.limit, saved.started, saved.requests
+	}()
+	sessionEnabled, sessionWorkbooks, sessionCacheLimit = true, nil, limit
+	sessionStarted, sessionRequests = time.Now(), 0
+	body()
+}
+
+func writeWorkbook(t *testing.T, path string) {
+	t.Helper()
+	f := excelize.NewFile()
+	defer func() { _ = f.Close() }()
+	if err := f.SaveAs(path); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+// A session must hand back the handle it already has rather than re-parsing,
+// and must drop the least recently used one when it runs out of room — that
+// eviction is what bounds the memory a long-lived session uses.
+func TestSessionCacheReusesAndEvicts(t *testing.T) {
+	dir := t.TempDir()
+	paths := make([]string, 3)
+	for i := range paths {
+		paths[i] = filepath.Join(dir, fmt.Sprintf("book%d.xlsx", i))
+		writeWorkbook(t, paths[i])
+	}
+
+	withSession(t, 2, func() {
+		first, err := openWorkbook(paths[0], workbookOptions{})
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		again, err := openWorkbook(paths[0], workbookOptions{})
+		if err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		if first != again {
+			t.Error("the same workbook should come back from the cache, not be re-parsed")
+		}
+
+		for _, path := range paths[1:] {
+			if _, err = openWorkbook(path, workbookOptions{}); err != nil {
+				t.Fatalf("open %s: %v", path, err)
+			}
+		}
+		cached := cachedWorkbookPaths()
+		if len(cached) != 2 {
+			t.Fatalf("cache holds %d workbooks, want 2: %v", len(cached), cached)
+		}
+		if cached[0] != paths[2] {
+			t.Errorf("most recently used should be first, got %v", cached)
+		}
+
+		// paths[0] fell out of the cache, so opening it must parse afresh.
+		reopened, err := openWorkbook(paths[0], workbookOptions{})
+		if err != nil {
+			t.Fatalf("reopen after eviction: %v", err)
+		}
+		if reopened == first {
+			t.Error("an evicted workbook must be re-parsed, not handed back")
+		}
+	})
+}
+
+// Outside a session nothing is cached: every command opens and closes its own
+// workbook, which is what keeps the one-shot CLI self-contained.
+func TestNoCacheOutsideSession(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "book.xlsx")
+	writeWorkbook(t, path)
+
+	first, err := openWorkbook(path, workbookOptions{})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	second, err := openWorkbook(path, workbookOptions{})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if first == second {
+		t.Error("without a session each open must be independent")
+	}
+	if entries := cachedWorkbookPaths(); len(entries) != 0 {
+		t.Errorf("nothing should be cached outside a session, got %v", entries)
+	}
+	releaseWorkbook(first)
+	releaseWorkbook(second)
+}
+
+func TestPingReportsSessionState(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "book.xlsx")
+	writeWorkbook(t, path)
+
+	withSession(t, 4, func() {
+		if _, err := openWorkbook(path, workbookOptions{}); err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		sessionRequests = 7
+		data := pingData()
+		if data["status"] != "ok" {
+			t.Errorf("status = %v, want ok", data["status"])
+		}
+		if data["requests"] != 7 {
+			t.Errorf("requests = %v, want 7", data["requests"])
+		}
+		paths, ok := data["cached_workbooks"].([]string)
+		if !ok || len(paths) != 1 || paths[0] != path {
+			t.Errorf("cached_workbooks = %v, want [%s]", data["cached_workbooks"], path)
+		}
+	})
+
+	// With nothing open the field is omitted rather than reported as null.
+	withSession(t, 4, func() {
+		if _, present := pingData()["cached_workbooks"]; present {
+			t.Error("cached_workbooks should be absent when nothing is open")
+		}
+	})
+}
+
+// A caller feeding a model needs to see the cost of a response before it
+// accumulates, and needs to be told plainly when one would dominate a context
+// window rather than left to notice a number.
+func TestSizeWarning(t *testing.T) {
+	for _, small := range []int{0, 1024, largeResponseBytes - 1} {
+		if got := sizeWarning(small); got != "" {
+			t.Errorf("sizeWarning(%d) = %q, want empty", small, got)
+		}
+	}
+	got := sizeWarning(largeResponseBytes)
+	if got == "" {
+		t.Fatal("a response at the threshold should warn")
+	}
+	for _, want := range []string{"--columns", "--limit", "--format tsv"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the warning should name %s as a way out, got %q", want, got)
+		}
+	}
+}
+
+// The data payload is marshalled before the envelope so its size can be
+// reported; embedding it as RawMessage must not change it.
+func TestEnvelopeReportsDataBytes(t *testing.T) {
+	data := map[string]any{"rows": []string{"> 23 Inch", "A&B"}, "n": 3}
+	encoded, err := marshalNoEscape(data)
+	if err != nil {
+		t.Fatalf("marshalNoEscape: %v", err)
+	}
+	if bytes.HasSuffix(encoded, []byte("\n")) {
+		t.Error("the size must not count a trailing newline")
+	}
+	if bytes.Contains(encoded, []byte(`\u003`)) || bytes.Contains(encoded, []byte(`\u002`)) {
+		t.Errorf("data should not be HTML-escaped: %s", encoded)
+	}
+
+	out, err := marshalNoEscape(envelope{
+		OK: true, Command: "read", Version: version,
+		DataBytes: len(encoded), Data: encoded,
+	})
+	if err != nil {
+		t.Fatalf("envelope: %v", err)
+	}
+	var parsed struct {
+		DataBytes int             `json:"data_bytes"`
+		Data      json.RawMessage `json:"data"`
+	}
+	if err = json.Unmarshal(out, &parsed); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if parsed.DataBytes != len(encoded) {
+		t.Errorf("data_bytes = %d, want %d", parsed.DataBytes, len(encoded))
+	}
+	if string(parsed.Data) != string(encoded) {
+		t.Errorf("the payload changed in transit:\n got %s\nwant %s", parsed.Data, encoded)
+	}
+}
+
+// Grouping by a near-unique column returns the table with extra steps; the
+// warning exists to say so before the cost lands in a caller's context.
+func TestGroupWarning(t *testing.T) {
+	if got := groupWarning(11, 0); got != "" {
+		t.Errorf("a small grouping needs no warning, got %q", got)
+	}
+	if got := groupWarning(aggGroupWarnThreshold, 0); got != "" {
+		t.Errorf("at the threshold there is still nothing to say, got %q", got)
+	}
+	got := groupWarning(aggGroupWarnThreshold+1, 0)
+	if got == "" {
+		t.Fatal("an unbounded large grouping should warn")
+	}
+	if !strings.Contains(got, "--limit") {
+		t.Errorf("the warning should name the way out, got %q", got)
+	}
+	if got := groupWarning(50000, 100); got != "" {
+		t.Errorf("a caller who set --limit has already handled it, got %q", got)
+	}
+}
+
+func TestLooksLikeDate(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{in: "2024-01-01", want: true},
+		{in: "2024/01/01", want: true},
+		{in: "2024-01-01 12:30", want: true},
+		{in: "20240101", want: false},
+		{in: "2024-1-1", want: false},
+		{in: "not a date", want: false},
+		{in: "", want: false},
+		{in: "1234.5", want: false},
+	}
+	for _, tc := range cases {
+		if got := looksLikeDate(tc.in); got != tc.want {
+			t.Errorf("looksLikeDate(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// marshalLikeCLI encodes v exactly the way writeEnvelope does. Using
+// json.Marshal here instead would HTML-escape the output itself and mask the
+// very bug these tests exist to catch.
+func marshalLikeCLI(t *testing.T, v any) string {
+	t.Helper()
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(v); err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	return strings.TrimRight(buf.String(), "\n")
+}
+
+func TestParseFilter(t *testing.T) {
+	cases := []struct {
+		expr   string
+		col    string
+		op     string
+		value  string
+		isNum  bool
+		number float64
+		wantOK bool
+	}{
+		{expr: "金额>1000", col: "金额", op: ">", value: "1000", isNum: true, number: 1000, wantOK: true},
+		// The two-character operators must win over their one-character
+		// prefixes, so "A>=5" has to parse as ">=" and not as ">".
+		{expr: "A>=5", col: "A", op: ">=", value: "5", isNum: true, number: 5, wantOK: true},
+		{expr: "A<=5", col: "A", op: "<=", value: "5", isNum: true, number: 5, wantOK: true},
+		{expr: "status!=done", col: "status", op: "!=", value: "done", wantOK: true},
+		{expr: "status=done", col: "status", op: "=", value: "done", wantOK: true},
+		{expr: "name~张", col: "name", op: "~", value: "张", wantOK: true},
+		{expr: `备注="has space"`, col: "备注", op: "=", value: "has space", wantOK: true},
+		{expr: "", wantOK: false},
+		{expr: "金额", wantOK: false},
+		{expr: ">1000", wantOK: false},
+	}
+	for _, tc := range cases {
+		got, err := parseFilter(tc.expr)
+		if tc.wantOK != (err == nil) {
+			t.Errorf("parseFilter(%q) error = %v, wantOK = %v", tc.expr, err, tc.wantOK)
+			continue
+		}
+		if !tc.wantOK {
+			continue
+		}
+		if got.col != tc.col || got.op != tc.op || got.value != tc.value {
+			t.Errorf("parseFilter(%q) = {%q %q %q}, want {%q %q %q}",
+				tc.expr, got.col, got.op, got.value, tc.col, tc.op, tc.value)
+		}
+		if got.isNum != tc.isNum {
+			t.Errorf("parseFilter(%q).isNum = %v, want %v", tc.expr, got.isNum, tc.isNum)
+		}
+		if tc.isNum && got.num != tc.number {
+			t.Errorf("parseFilter(%q).num = %v, want %v", tc.expr, got.num, tc.number)
+		}
+	}
+}
+
+func TestFilterMatch(t *testing.T) {
+	cases := []struct {
+		expr string
+		cell string
+		want bool
+	}{
+		// A numeric filter against a cell that is not a number must fail to
+		// match rather than falling back to comparing text.
+		{expr: "金额>1000", cell: "2000", want: true},
+		{expr: "金额>1000", cell: "500", want: false},
+		{expr: "金额>1000", cell: "无", want: false},
+		{expr: "金额>=1000", cell: "1,000", want: true},
+		// Equality and substring are case-insensitive.
+		{expr: "status=done", cell: "DONE", want: true},
+		{expr: "status!=done", cell: "DONE", want: false},
+		{expr: "status!=done", cell: "other", want: true},
+		{expr: "name~张", cell: "张三", want: true},
+		{expr: "name~张", cell: "李四", want: false},
+		// A non-numeric filter falls back to a lexicographic comparison.
+		{expr: "name>m", cell: "z", want: true},
+		{expr: "name>m", cell: "a", want: false},
+	}
+	for _, tc := range cases {
+		flt, err := parseFilter(tc.expr)
+		if err != nil {
+			t.Fatalf("parseFilter(%q): %v", tc.expr, err)
+		}
+		if got := flt.match(tc.cell); got != tc.want {
+			t.Errorf("match(%q, %q) = %v, want %v", tc.expr, tc.cell, got, tc.want)
+		}
+	}
+}
+
+func TestMatchFiltersANDsClauses(t *testing.T) {
+	filters, err := parseFilterList([]string{"金额>1000", "status=done"})
+	if err != nil {
+		t.Fatalf("parseFilterList: %v", err)
+	}
+	for i, flt := range filters {
+		flt.idx = i
+	}
+	if !matchFilters(filters, []string{"5000", "DONE"}) {
+		t.Error("both clauses hold, want match")
+	}
+	if matchFilters(filters, []string{"5000", "open"}) {
+		t.Error("second clause fails, want no match")
+	}
+	if matchFilters(filters, []string{"10", "DONE"}) {
+		t.Error("first clause fails, want no match")
+	}
+	// A row shorter than the filter's column index reads as empty.
+	if matchFilters(filters, []string{"5000"}) {
+		t.Error("missing cell should not satisfy status=done")
+	}
+}
+
+func TestParseNumber(t *testing.T) {
+	cases := []struct {
+		in     string
+		want   float64
+		wantOK bool
+	}{
+		{in: "1000", want: 1000, wantOK: true},
+		{in: "1,000", want: 1000, wantOK: true},
+		{in: " 42 ", want: 42, wantOK: true},
+		{in: "-3.5", want: -3.5, wantOK: true},
+		{in: "", wantOK: false},
+		{in: "abc", wantOK: false},
+		// Currency and percent signs are deliberately not stripped.
+		{in: "¥100", wantOK: false},
+		{in: "50%", wantOK: false},
+	}
+	for _, tc := range cases {
+		got, ok := parseNumber(tc.in)
+		if ok != tc.wantOK || (ok && got != tc.want) {
+			t.Errorf("parseNumber(%q) = (%v, %v), want (%v, %v)", tc.in, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}
+
+func TestHeaderKeys(t *testing.T) {
+	cases := []struct {
+		name   string
+		header []string
+		width  int
+		want   []string
+	}{
+		{name: "as-is", header: []string{"name", "age"}, width: 2, want: []string{"name", "age"}},
+		{name: "blank falls back to column letter", header: []string{"", "x"}, width: 2, want: []string{"A", "x"}},
+		{name: "duplicates get a suffix", header: []string{"a", "a"}, width: 2, want: []string{"a", "a_2"}},
+		{name: "no header at all", header: nil, width: 2, want: []string{"A", "B"}},
+		{name: "wider than the header", header: []string{"a"}, width: 3, want: []string{"a", "B", "C"}},
+	}
+	for _, tc := range cases {
+		got := headerKeys(tc.header, tc.width)
+		if len(got) != len(tc.want) {
+			t.Errorf("%s: headerKeys(%v, %d) = %v, want %v", tc.name, tc.header, tc.width, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("%s: headerKeys(%v, %d) = %v, want %v", tc.name, tc.header, tc.width, got, tc.want)
+				break
+			}
+		}
+	}
+}
+
+func TestPadRow(t *testing.T) {
+	got := padRow([]string{"a"}, 3)
+	if len(got) != 3 || got[0] != "a" || got[1] != "" || got[2] != "" {
+		t.Errorf("padRow short = %v, want [a  ]", got)
+	}
+	got = padRow([]string{"a", "b", "c"}, 2)
+	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("padRow long = %v, want [a b]", got)
+	}
+	got = padRow([]string{"a", "b"}, 2)
+	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("padRow exact = %v, want [a b]", got)
+	}
+}
+
+func TestResolveColumn(t *testing.T) {
+	header := []string{"名称", "金额"}
+	cases := []struct {
+		ref    string
+		want   int
+		wantOK bool
+	}{
+		{ref: "名称", want: 0, wantOK: true},
+		{ref: "金额", want: 1, wantOK: true},
+		{ref: "金额 ", want: 1, wantOK: true},
+		{ref: "A", want: 0, wantOK: true},
+		{ref: "b", want: 1, wantOK: true},
+		{ref: "1", want: 0, wantOK: true},
+		{ref: "2", want: 1, wantOK: true},
+		{ref: "!!!", wantOK: false},
+		{ref: "0", wantOK: false},
+		{ref: "", wantOK: false},
+	}
+	for _, tc := range cases {
+		got, err := resolveColumn(tc.ref, header)
+		if tc.wantOK != (err == nil) {
+			t.Errorf("resolveColumn(%q) error = %v, wantOK = %v", tc.ref, err, tc.wantOK)
+			continue
+		}
+		if tc.wantOK && got != tc.want {
+			t.Errorf("resolveColumn(%q) = %d, want %d", tc.ref, got, tc.want)
+		}
+	}
+	// Without a header a name is not resolvable, but letters and indexes are.
+	if _, err := resolveColumn("名称", nil); err == nil {
+		t.Error("resolveColumn(\"名称\", nil) should fail without a header")
+	}
+	if got, err := resolveColumn("B", nil); err != nil || got != 1 {
+		t.Errorf("resolveColumn(\"B\", nil) = (%d, %v), want (1, nil)", got, err)
+	}
+}
+
+// Real sheets pad header cells with spaces. info reports such a column as
+// "名称" because headerKeys trims it, so asking for "名称" has to work — a tool
+// that hands out a name and then refuses it leaves the caller guessing.
+func TestResolveColumnTrimsPaddedHeaders(t *testing.T) {
+	header := []string{"  代码 ", "\t名称 ", "  "}
+	cases := []struct {
+		ref  string
+		want int
+	}{
+		{ref: "名称", want: 1},
+		{ref: " 名称", want: 1},
+		{ref: "代码", want: 0},
+	}
+	for _, tc := range cases {
+		got, err := resolveColumn(tc.ref, header)
+		if err != nil || got != tc.want {
+			t.Errorf("resolveColumn(%q, padded) = (%d, %v), want (%d, nil)", tc.ref, got, err, tc.want)
+		}
+	}
+	// A header of nothing but whitespace is not a name at all.
+	if _, err := resolveColumn("", header); err == nil {
+		t.Error("an empty reference should still fail")
+	}
+}
+
+func TestParseDimension(t *testing.T) {
+	cases := []struct {
+		ref       string
+		rows, col int
+	}{
+		{ref: "A1:F100", rows: 100, col: 6},
+		{ref: "$A$1:$F$100", rows: 100, col: 6},
+		{ref: "A1", rows: 1, col: 1},
+		{ref: "", rows: 0, col: 0},
+		{ref: "nonsense", rows: 0, col: 0},
+	}
+	for _, tc := range cases {
+		rows, cols := parseDimension(tc.ref)
+		if rows != tc.rows || cols != tc.col {
+			t.Errorf("parseDimension(%q) = (%d, %d), want (%d, %d)",
+				tc.ref, rows, cols, tc.rows, tc.col)
+		}
+	}
+}
+
+func TestSplitList(t *testing.T) {
+	if got := splitList(""); got != nil {
+		t.Errorf("splitList(\"\") = %v, want nil", got)
+	}
+	got := splitList(" a , b ,, ")
+	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("splitList = %v, want [a b]", got)
+	}
+}
+
+func TestColumnLetter(t *testing.T) {
+	if got := columnLetter(1); got != "A" {
+		t.Errorf("columnLetter(1) = %q, want A", got)
+	}
+	if got := columnLetter(27); got != "AA" {
+		t.Errorf("columnLetter(27) = %q, want AA", got)
+	}
+}
+
+// orderedRow exists so that column order survives marshalling; a plain map
+// would be sorted alphabetically by encoding/json.
+func TestOrderedRowPreservesColumnOrder(t *testing.T) {
+	row := orderedRow{keys: []string{"z", "a", "m"}, vals: []any{"1", "2", "3"}}
+	if got, want := marshalLikeCLI(t, row), `{"z":"1","a":"2","m":"3"}`; got != want {
+		t.Errorf("Marshal(orderedRow) = %s, want %s", got, want)
+	}
+}
+
+// Object-form rows must escape exactly like array-form rows. A spreadsheet
+// value such as "> 23 Inch" or a company name containing an ampersand must not
+// come out with numeric unicode escapes in one mode and not the other.
+func TestOrderedRowDoesNotHTMLEscape(t *testing.T) {
+	row := orderedRow{keys: []string{"a", "b"}, vals: []any{"> 23 Inch", "A&B"}}
+	if got, want := marshalLikeCLI(t, row), `{"a":"> 23 Inch","b":"A&B"}`; got != want {
+		t.Errorf("Marshal(orderedRow) = %s, want %s", got, want)
+	}
+	arrays := [][]string{{"> 23 Inch", "A&B"}}
+	if got, want := marshalLikeCLI(t, arrays), `[["> 23 Inch","A&B"]]`; got != want {
+		t.Errorf("Marshal(array rows) = %s, want %s", got, want)
+	}
+}
+
+// An aggregate must come back as a JSON number, not a quoted string, so that a
+// caller does not have to re-parse it before doing arithmetic.
+func TestOrderedRowEmitsNumbers(t *testing.T) {
+	row := orderedRow{
+		keys: []string{"region", "total"},
+		vals: []any{"华北", 2839456194.25},
+	}
+	if got, want := marshalLikeCLI(t, row), `{"region":"华北","total":2839456194.25}`; got != want {
+		t.Errorf("Marshal(orderedRow) = %s, want %s", got, want)
+	}
+}

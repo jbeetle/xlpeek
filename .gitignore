@@ -1,0 +1,15 @@
+# Build output
+/bin/
+/xlpeek
+/xlpeek.exe
+/xlpeek-linux-*
+/xlpeek-darwin-*
+
+# Python bytecode from the regression suites
+__pycache__/
+*.pyc
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
