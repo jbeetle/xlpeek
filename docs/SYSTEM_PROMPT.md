@@ -34,6 +34,7 @@
   直接求和低估了 30%。agg 会自动把这个列在 unaccounted_columns 里报出来并给出
   warning —— 看到 warning_count > 0 就先把它加进 --group-by 拆开看，再折算相加。
   绝不对可能混合单位的列直接求和。
+  （币种写进单元格格式、同一列混用 ¥/$ 时也一样：agg 会单独告警。）
 - 合并单元格只在左上角存值，其余为空，看起来像空行。read/agg/profile 都用 --fill-merged 填；
   agg 遇到"有行落进空分组"会主动告警并提示它。
 - 程序生成的 xlsx（openpyxl/pandas/xlsxwriter）公式列没有缓存值，默认读成空串，agg 求和得

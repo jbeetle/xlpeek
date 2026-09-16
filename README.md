@@ -92,8 +92,8 @@ covers how it is meant to be *driven*, and how it is checked:
 
 | File | For | Size |
 | --- | --- | --- |
-| [docs/SYSTEM_PROMPT.md](docs/SYSTEM_PROMPT.md) | paste into an agent's system prompt | ~730 tokens |
-| [docs/AGENTS.md](docs/AGENTS.md) | the agent's reference, loaded on demand | ~6,400 tokens |
+| [docs/SYSTEM_PROMPT.md](docs/SYSTEM_PROMPT.md) | paste into an agent's system prompt | ~850 tokens |
+| [docs/AGENTS.md](docs/AGENTS.md) | the agent's reference, loaded on demand | ~7,400 tokens |
 | [examples/nodejs](examples/nodejs) | a Node wrapper and the stdio traps it avoids | |
 | [examples/regression](examples/regression) | eleven cross-validation suites, `run_all.py` | |
 
