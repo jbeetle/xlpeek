@@ -95,6 +95,28 @@ func TestParseExprErrors(t *testing.T) {
 	}
 }
 
+func TestBracketHint(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantHint bool
+	}{
+		// A column name from a real workbook: the parenthesis is arithmetic to
+		// the parser, and the bracket escape is not something to be guessed.
+		{in: "金额(万元)", wantHint: true},
+		{in: "Order Amount", wantHint: true},
+		// Ordinary mistakes stay ordinary: no suggestion to rename them.
+		{in: "1+*2", wantHint: false},
+		{in: "收入金额-", wantHint: false},
+		{in: "", wantHint: false},
+	}
+	for _, tc := range cases {
+		got := bracketHint(tc.in)
+		if (got != "") != tc.wantHint {
+			t.Errorf("bracketHint(%q) = %q, want hint=%v", tc.in, got, tc.wantHint)
+		}
+	}
+}
+
 func TestIdentifiersAreCollected(t *testing.T) {
 	node, err := parseExpr("(a+b)*c-2023")
 	if err != nil {
@@ -688,15 +710,144 @@ func TestParseNumber(t *testing.T) {
 		{in: "-3.5", want: -3.5, wantOK: true},
 		{in: "", wantOK: false},
 		{in: "abc", wantOK: false},
-		// Currency and percent signs are deliberately not stripped.
-		{in: "¥100", wantOK: false},
-		{in: "50%", wantOK: false},
+		// A number format decorates the stored value, and the decoration is
+		// read with it — on either side, and in either sign position, because
+		// "-¥1,234.50" and "¥-1,234.50" are both things a format can produce.
+		{in: "¥100", want: 100, wantOK: true},
+		{in: "¥1,234.50", want: 1234.5, wantOK: true},
+		{in: "-¥1,234.50", want: -1234.5, wantOK: true},
+		{in: "¥-1,234.50", want: -1234.5, wantOK: true},
+		{in: "1,234.50€", want: 1234.5, wantOK: true},
+		{in: "￥100", want: 100, wantOK: true},
+		// A percent sign is a scale rather than decoration: it divides, so that
+		// the display value and the stored value agree.
+		{in: "50%", want: 0.5, wantOK: true},
+		{in: "12.35%", want: 0.1235, wantOK: true},
+		{in: "-2.5%", want: -0.025, wantOK: true},
+		// Text that merely mentions an amount stays text.
+		{in: "50% off", wantOK: false},
+		{in: "USD 100", wantOK: false},
+		{in: "¥", wantOK: false},
+		{in: "¥$100", wantOK: false},
 	}
 	for _, tc := range cases {
 		got, ok := parseNumber(tc.in)
 		if ok != tc.wantOK || (ok && got != tc.want) {
 			t.Errorf("parseNumber(%q) = (%v, %v), want (%v, %v)", tc.in, got, ok, tc.want, tc.wantOK)
 		}
+	}
+}
+
+func TestParseNumberUnitReportsCurrency(t *testing.T) {
+	cases := []struct {
+		in     string
+		want   float64
+		unit   string
+		wantOK bool
+	}{
+		{in: "¥1,234.50", want: 1234.5, unit: "¥", wantOK: true},
+		{in: "$1,234.50", want: 1234.5, unit: "$", wantOK: true},
+		{in: "1,234.50€", want: 1234.5, unit: "€", wantOK: true},
+		{in: "￥100", want: 100, unit: "￥", wantOK: true},
+		// A percent sign scales the value and is not a currency of its own.
+		{in: "12.35%", want: 0.1235, unit: "", wantOK: true},
+		{in: "1234.5", want: 1234.5, unit: "", wantOK: true},
+	}
+	for _, tc := range cases {
+		got, unit, ok := parseNumberUnit(tc.in)
+		if ok != tc.wantOK || unit != tc.unit || (ok && got != tc.want) {
+			t.Errorf("parseNumberUnit(%q) = (%v, %q, %v), want (%v, %q, %v)",
+				tc.in, got, unit, ok, tc.want, tc.unit, tc.wantOK)
+		}
+	}
+}
+
+// A filtered comparison must not fall back to comparing strings once the value
+// carries a number format: "5.00%" is not greater than "20%" under any reading
+// of the two, but it is greater lexicographically, and that is how a filter
+// silently returns the wrong rows.
+func TestFilterMatchesFormattedNumbers(t *testing.T) {
+	cases := []struct {
+		expr string
+		cell string
+		want bool
+	}{
+		{expr: "比率>20%", cell: "25.67%", want: true},
+		{expr: "比率>20%", cell: "5.00%", want: false},
+		{expr: "比率<20%", cell: "5.00%", want: true},
+		{expr: "比率>2%", cell: "5.00%", want: true},
+		{expr: "比率>0.2", cell: "12.35%", want: false},
+		{expr: "金额>¥2000", cell: "¥2,345.25", want: true},
+		{expr: "金额>¥2000", cell: "¥999.99", want: false},
+		{expr: "金额>2000", cell: "¥2,345.25", want: true},
+		{expr: "金额>2000", cell: "$2,345.25", want: true},
+		// A text comparison is still a text comparison.
+		{expr: "名称>A", cell: "B", want: true},
+	}
+	for _, tc := range cases {
+		flt, err := parseFilter(tc.expr)
+		if err != nil {
+			t.Fatalf("parseFilter(%q): %v", tc.expr, err)
+		}
+		if got := flt.match(tc.cell); got != tc.want {
+			t.Errorf("%q matches %q = %v, want %v", tc.expr, tc.cell, got, tc.want)
+		}
+	}
+}
+
+func TestColumnWarnings(t *testing.T) {
+	// Cells that are all empty: the aggregates are null, and the likeliest
+	// reason — a formula with no cached result — comes with a way to fix it.
+	got := columnWarnings([]string{"公式列"}, []int{0}, []int{0}, []map[string]bool{nil}, []bool{true}, 2, false)
+	if len(got) != 1 || !strings.Contains(got[0], "公式列") || !strings.Contains(got[0], "--calc") {
+		t.Errorf("expected a column warning naming the column and --calc, got %q", got)
+	}
+	// Already asked for --calc: state the fact without repeating the advice.
+	got = columnWarnings([]string{"公式列"}, []int{0}, []int{0}, []map[string]bool{nil}, []bool{true}, 2, true)
+	if len(got) != 1 || strings.Contains(got[0], "--calc") {
+		t.Errorf("expected a hint-free column warning, got %q", got)
+	}
+	// A filled text column is not an empty one, and must not be sent down the
+	// --calc path: that would cost a whole-sheet parse to learn nothing.
+	got = columnWarnings([]string{"备注"}, []int{0}, []int{86}, []map[string]bool{nil}, []bool{true}, 2700, false)
+	if len(got) != 1 || !strings.Contains(got[0], "text, not numbers") || strings.Contains(got[0], "--calc") {
+		t.Errorf("expected a text-column warning without the --calc advice, got %q", got)
+	}
+	// Every cell parsed, but two currencies were summed together.
+	got = columnWarnings([]string{"金额"}, []int{2}, []int{2}, []map[string]bool{{"¥": true, "$": true}}, []bool{true}, 2, false)
+	if len(got) != 1 || !strings.Contains(got[0], "currencies") {
+		t.Errorf("expected a mixed-currency warning, got %q", got)
+	}
+	// A count-distinct column is never read as a number, so a text column is
+	// not a missing one.
+	if got = columnWarnings([]string{"客户"}, []int{0}, []int{5}, []map[string]bool{nil}, []bool{false}, 2, false); got != nil {
+		t.Errorf("count-distinct column should not be warned about, got %q", got)
+	}
+	// Nothing matched: the empty result is the message.
+	if got = columnWarnings([]string{"金额"}, []int{0}, []int{0}, []map[string]bool{nil}, []bool{true}, 0, false); got != nil {
+		t.Errorf("no matched rows should produce no column warnings, got %q", got)
+	}
+}
+
+func TestBlankGroupWarning(t *testing.T) {
+	groups := map[string]*groupState{
+		"华北": {keys: []string{"华北"}, rows: 1},
+		"":   {keys: []string{""}, rows: 2},
+	}
+	order := []string{"", "华北"}
+	warning := blankGroupWarning(groups, order, []string{"区域"}, false)
+	if !strings.Contains(warning, "2 rows") || !strings.Contains(warning, "--fill-merged") {
+		t.Errorf("expected the blank rows to be counted and --fill-merged suggested, got %q", warning)
+	}
+	// With the flag already given there is nothing left to suggest, but the
+	// rows still went into an empty group and the count still stands.
+	if warning = blankGroupWarning(groups, order, []string{"区域"}, true); !strings.Contains(warning, "2 rows") ||
+		strings.Contains(warning, "--fill-merged") {
+		t.Errorf("expected a hint-free blank-group warning, got %q", warning)
+	}
+	// A grand total groups nothing, so there is no key to be blank.
+	if warning = blankGroupWarning(groups, order, nil, false); warning != "" {
+		t.Errorf("an ungrouped aggregate should not warn about blank keys, got %q", warning)
 	}
 }
 

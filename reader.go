@@ -379,16 +379,65 @@ func scanSheet(f *excelize.File, sheet string, headerRow, sampleRows int, deep b
 
 // mergeRange is a merged region together with the value that belongs to every
 // cell inside it.
-//
-// A spreadsheet stores a merged value only in the top-left cell of the region
-// and leaves the rest empty, so a reader that ignores merges sees blanks
-// wherever a report used a merged heading or a label spanning several rows —
-// and reasons confidently from them.
 type mergeRange struct {
 	ref                string
 	startCol, startRow int
 	endCol, endRow     int
 	value              string
+}
+
+// mergeFiller applies a worksheet's merged regions to rows as they stream past.
+//
+// A spreadsheet stores a merged value only in the top-left cell of the region
+// and leaves the rest empty, so a reader that ignores merges sees blanks
+// wherever a report used a merged heading or a label spanning several rows —
+// and reasons confidently from them. Filling those in is what lets a group-by
+// column hold the label its rows are actually filed under.
+//
+// Rows arrive in ascending order, so the region list is walked exactly once and
+// only the regions covering the current row are kept live.
+type mergeFiller struct {
+	ranges []mergeRange
+	active []mergeRange
+	next   int
+}
+
+// newMergeFiller loads a worksheet's merged regions.
+//
+// GetMergeCells parses the worksheet structure and reads each region's value,
+// so this gives up the streaming memory profile the same way --calc does. It
+// is therefore opt-in rather than always on.
+func newMergeFiller(f *excelize.File, sheet string) (*mergeFiller, error) {
+	ranges, err := loadMergeRanges(f, sheet)
+	if err != nil {
+		return nil, err
+	}
+	return &mergeFiller{ranges: ranges, active: make([]mergeRange, 0, 8)}, nil
+}
+
+// apply drops the regions that ended before this row, admits the ones starting
+// on it, then writes their value into the cells they span.
+func (m *mergeFiller) apply(row int, cells []string, maxColumns int) []string {
+	if len(m.ranges) == 0 {
+		return cells
+	}
+	alive := m.active[:0]
+	for _, r := range m.active {
+		if r.endRow >= row {
+			alive = append(alive, r)
+		}
+	}
+	m.active = alive
+	for m.next < len(m.ranges) && m.ranges[m.next].startRow <= row {
+		if m.ranges[m.next].endRow >= row {
+			m.active = append(m.active, m.ranges[m.next])
+		}
+		m.next++
+	}
+	if len(m.active) == 0 {
+		return cells
+	}
+	return fillMergedRow(cells, m.active, maxColumns)
 }
 
 // loadMergeRanges collects the merged regions of a worksheet, ordered by the
@@ -518,42 +567,21 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 	}
 
 	var (
-		pos          int
-		skipped      int
-		probe        int
-		mergeRanges  []mergeRange
-		nextRange    int
-		activeMerges = make([]mergeRange, 0, 8)
+		pos     int
+		skipped int
+		probe   int
+		merges  *mergeFiller
 	)
 	if req.fillMerged {
-		if mergeRanges, err = loadMergeRanges(f, req.sheet); err != nil {
+		if merges, err = newMergeFiller(f, req.sheet); err != nil {
 			return nil, err
 		}
 	}
-	// applyMerges drops the regions that ended before this row, admits the ones
-	// starting on it, then fills their value into the cells they span. Rows
-	// arrive in ascending order, so the region list is walked exactly once.
 	applyMerges := func(row int, cells []string) []string {
-		if len(mergeRanges) == 0 {
+		if merges == nil {
 			return cells
 		}
-		alive := activeMerges[:0]
-		for _, r := range activeMerges {
-			if r.endRow >= row {
-				alive = append(alive, r)
-			}
-		}
-		activeMerges = alive
-		for nextRange < len(mergeRanges) && mergeRanges[nextRange].startRow <= row {
-			if mergeRanges[nextRange].endRow >= row {
-				activeMerges = append(activeMerges, mergeRanges[nextRange])
-			}
-			nextRange++
-		}
-		if len(activeMerges) == 0 {
-			return cells
-		}
-		return fillMergedRow(cells, activeMerges, req.maxColumns)
+		return merges.apply(row, cells, req.maxColumns)
 	}
 
 	for iter.Next() {

@@ -246,6 +246,110 @@ func buildUnaccountedReport(tracked map[int]*unaccountedColumn) []unaccountedRep
 	return report
 }
 
+// rowsPhrase renders a row count so that a warning reads as a sentence: "1 row"
+// and "23 rows" are both correct, and a bare "%d rows" is not.
+func rowsPhrase(n int) string {
+	if n == 1 {
+		return "1 row"
+	}
+	return fmt.Sprintf("%d rows", n)
+}
+
+// columnWarnings reports the two ways a column can make an aggregate
+// meaningless while every individual cell in it still looks fine.
+//
+// The first is producing no numbers at all: a sum over such a column is null,
+// and null is easy to read as "no rows" rather than "no values", so the column
+// is named — along with the likeliest reason a money or figure column reads
+// empty, which is a formula whose cached result was never written. The second
+// is producing numbers in more than one currency: each cell parses, the total
+// is still nonsense, and no other check would notice because both currencies
+// are decoration on the cell rather than a column of their own.
+func columnWarnings(names []string, present, filled []int, units []map[string]bool, numeric []bool, rowsMatched int, calc bool) []string {
+	if rowsMatched == 0 {
+		// An empty result already says there was nothing to aggregate; blaming
+		// every referenced column for it would be noise.
+		return nil
+	}
+	var warnings []string
+	for i, name := range names {
+		if i >= len(numeric) || !numeric[i] {
+			continue
+		}
+		if present[i] == 0 {
+			// Distinguish "there is nothing in this column" from "there is
+			// something, and it is not a number": only the first can be fixed
+			// by --calc, and sending a text column down that path wastes a
+			// whole-sheet parse.
+			reason := "the filled cells hold text, not numbers"
+			switch {
+			case filled[i] == 0 && !calc:
+				reason = "the cells are empty in these rows; a formula with no cached result reads " +
+					"this way, so re-run with --calc if that is what they are"
+			case filled[i] == 0:
+				reason = "the cells are empty in these rows"
+			}
+			warnings = append(warnings, fmt.Sprintf(
+				"column %q produced no numeric values across %s, so its aggregates are null: %s",
+				name, rowsPhrase(rowsMatched), reason))
+		}
+		if len(units[i]) > 1 {
+			symbols := make([]string, 0, len(units[i]))
+			for symbol := range units[i] {
+				symbols = append(symbols, symbol)
+			}
+			sort.Strings(symbols)
+			warnings = append(warnings, fmt.Sprintf(
+				"column %q holds %d currencies (%s) and was aggregated straight through; the total "+
+					"adds incomparable amounts — convert to one currency, or group by the currency column",
+				name, len(units[i]), strings.Join(symbols, ", ")))
+		}
+	}
+	return warnings
+}
+
+// blankGroupWarning reports rows that were summarised under an empty grouping
+// key, and points at the usual reason.
+//
+// A spreadsheet stores a merged region's value only in its top-left cell, so a
+// report that merges a label across the rows it applies to leaves the rest of
+// them empty — and grouping on that column files those rows under "". An empty
+// key is easy to read as a value in the output, which makes this the silent
+// half of the problem --fill-merged exists to fix.
+func blankGroupWarning(groups map[string]*groupState, order []string, groupNames []string, fillMerged bool) string {
+	if len(groupNames) == 0 {
+		return ""
+	}
+	rows := 0
+	for _, key := range order {
+		group := groups[key]
+		blank := true
+		for _, value := range group.keys {
+			if strings.TrimSpace(value) != "" {
+				blank = false
+				break
+			}
+		}
+		if blank {
+			rows += group.rows
+		}
+	}
+	if rows == 0 {
+		return ""
+	}
+	hint := ""
+	if !fillMerged {
+		hint = "; if the sheet merges those labels across rows, re-run with --fill-merged"
+	}
+	if rows == 1 {
+		return fmt.Sprintf(
+			"1 row has no value in the grouping columns and was summarised under an empty key%s", hint)
+	}
+	return fmt.Sprintf(
+		"%d rows have no value in the grouping columns and were summarised together under an "+
+			"empty key%s", rows, hint)
+}
+
 // groupWarning explains an unbounded grouping that has stopped summarising.
 // It returns nothing when the caller capped the output themselves.
 func groupWarning(groups, limit int) string {
@@ -327,6 +431,8 @@ func cmdAgg(args []string) int {
 	headerFlag := fs.Bool("header", false, "treat row 1 as the header, so columns can be referred to by name")
 	headerRow := fs.Int("header-row", 0, "worksheet row holding the column names; overrides --header")
 	skipEmpty := fs.Bool("skip-empty", false, "drop rows whose cells are all empty")
+	calc := fs.Bool("calc", false, "evaluate formulas that have no cached value; loads the sheet into memory")
+	fillMerged := fs.Bool("fill-merged", false, "copy each merged region's value into every cell it spans; loads the sheet into memory")
 	offset := fs.Int("offset", 0, "output groups to skip")
 	fs.IntVar(offset, "o", 0, "output groups to skip (shorthand)")
 	limit := fs.Int("limit", 0, "maximum output groups; 0 means all")
@@ -380,7 +486,8 @@ func cmdAgg(args []string) int {
 			}
 			expr, err := parseExpr(source)
 			if err != nil {
-				return failUsage("agg", fmt.Sprintf("--%s %q: %v", group.kind, item, err))
+				return failUsage("agg", fmt.Sprintf("--%s %q: %v%s",
+					group.kind, item, err, bracketHint(source)))
 			}
 			specs = append(specs, &aggSpec{
 				kind: group.kind, name: name, source: source, expr: expr, index: -1,
@@ -411,7 +518,7 @@ func cmdAgg(args []string) int {
 		name, source := strings.TrimSpace(item[:eq]), strings.TrimSpace(item[eq+1:])
 		expr, err := parseExpr(source)
 		if err != nil {
-			return failUsage("agg", fmt.Sprintf("--derive %q: %v", item, err))
+			return failUsage("agg", fmt.Sprintf("--derive %q: %v%s", item, err, bracketHint(source)))
 		}
 		derives = append(derives, &deriveSpec{name: name, source: source, expr: expr})
 	}
@@ -463,7 +570,7 @@ func cmdAgg(args []string) int {
 	if err != nil {
 		return fail("agg", err, *pretty)
 	}
-	defer func() { _ = f.Close() }()
+	defer releaseWorkbook(f)
 
 	sheetName, sheetIndex, err := resolveSheet(f, sheet)
 	if err != nil {
@@ -475,6 +582,16 @@ func cmdAgg(args []string) int {
 		return failWithSheet("agg", err, f.GetSheetList(), *pretty)
 	}
 	defer func() { _ = iter.Close() }()
+
+	// Merged labels are a correctness hazard for aggregation rather than a
+	// display detail: a region covering three rows holds its label in the first
+	// of them, so grouping on that column would file the other two under "".
+	var merges *mergeFiller
+	if *fillMerged {
+		if merges, err = newMergeFiller(f, sheetName); err != nil {
+			return failWithSheet("agg", err, f.GetSheetList(), *pretty)
+		}
+	}
 
 	headerAt := 0
 	if *headerFlag {
@@ -503,6 +620,17 @@ func cmdAgg(args []string) int {
 		resolved    bool
 		used        = map[int]bool{}
 		unaccounted = map[int]*unaccountedColumn{}
+		// Per referenced column: how many cells were filled at all, how many of
+		// those produced a number, and which currencies they were presented in.
+		// Together these let the result tell "empty" apart from "not a number"
+		// when it warns about a total it could not compute.
+		refPresent []int
+		refFilled  []int
+		refUnits   []map[string]bool
+		numericRef []bool
+		// Warnings raised while evaluating formulas, capped like every other
+		// per-cell report so a broken workbook cannot pad the response.
+		formulaWarnings []string
 	)
 
 	// lookup reads a referenced column for the current row. It is defined once
@@ -528,9 +656,16 @@ func cmdAgg(args []string) int {
 			return err
 		}
 		wanted := map[string]bool{}
+		// numeric names the columns an aggregate reads as a number, which is not
+		// the same as every column referenced: --count-distinct counts the
+		// values of a text column without ever parsing them.
+		numeric := map[string]bool{}
 		for _, spec := range specs {
 			if spec.expr != nil {
 				identifiers(spec.expr, wanted)
+				if spec.kind != kindCountDistinct {
+					identifiers(spec.expr, numeric)
+				}
 			}
 			if spec.kind == kindCountDistinct {
 				wanted[spec.source] = true
@@ -553,6 +688,13 @@ func cmdAgg(args []string) int {
 		}
 		values = make([]float64, len(refNames))
 		present = make([]bool, len(refNames))
+		refPresent = make([]int, len(refNames))
+		refFilled = make([]int, len(refNames))
+		refUnits = make([]map[string]bool, len(refNames))
+		numericRef = make([]bool, len(refNames))
+		for i, name := range refNames {
+			numericRef[i] = numeric[name]
+		}
 		for _, spec := range specs {
 			if spec.kind == kindCountDistinct {
 				spec.index = colIndex[spec.source]
@@ -581,6 +723,9 @@ func cmdAgg(args []string) int {
 				if header, err = iter.Columns(); err != nil {
 					return failWithSheet("agg", err, f.GetSheetList(), *pretty)
 				}
+				if merges != nil {
+					header = merges.apply(pos, header, defaultMaxColumns)
+				}
 				if err = resolve(); err != nil {
 					return respondErr("agg", codeColumnNotFound, err.Error(), *pretty, exitUsage)
 				}
@@ -590,6 +735,23 @@ func cmdAgg(args []string) int {
 		cells, err := iter.Columns()
 		if err != nil {
 			return failWithSheet("agg", err, f.GetSheetList(), *pretty)
+		}
+		// A merged label is written into the cells the region spans before
+		// anything reads them, so grouping and filtering see the label the
+		// report put there rather than the blank the file stores.
+		if merges != nil {
+			cells = merges.apply(pos, cells, defaultMaxColumns)
+		}
+		// Formulas are only consulted for cells that came back empty, and only
+		// when asked for: resolving one makes excelize load the whole worksheet.
+		if *calc {
+			var warnings []string
+			cells, warnings = fillFormulas(f, sheetName, pos, cells)
+			for _, warning := range warnings {
+				if len(formulaWarnings) < maxWarnings {
+					formulaWarnings = append(formulaWarnings, warning)
+				}
+			}
 		}
 		if !resolved {
 			// No header row: names cannot be used, but letters and indexes can.
@@ -633,18 +795,35 @@ func cmdAgg(args []string) int {
 		}
 
 		// Parse each referenced column once, so a cell feeding several
-		// aggregates is read once and a non-numeric one is counted once.
+		// aggregates is read once and a non-numeric one is counted once. The
+		// currency a value was presented in is kept, because two of them in one
+		// column make the aggregate meaningless however well each cell parses.
 		for i, idx := range refIndexes {
 			values[i], present[i] = 0, false
+			if !numericRef[i] {
+				// A column that only --count-distinct reads is text on purpose.
+				// Parsing it as a number would count its every cell as a
+				// skipped one and invent a warning about values that were never
+				// meant to be numbers.
+				continue
+			}
 			raw := valueAt(cells, idx)
 			if raw == "" {
 				continue
 			}
-			number, ok := parseNumber(raw)
+			refFilled[i]++
+			number, unit, ok := parseNumberUnit(raw)
 			if !ok {
 				nonNumeric++
 				continue
 			}
+			if unit != "" {
+				if refUnits[i] == nil {
+					refUnits[i] = map[string]bool{}
+				}
+				refUnits[i][unit] = true
+			}
+			refPresent[i]++
 			values[i], present[i] = number, true
 		}
 
@@ -797,10 +976,25 @@ func cmdAgg(args []string) int {
 			break
 		}
 	}
+	if warning := blankGroupWarning(groups, order, groupNames, *fillMerged); warning != "" {
+		result.Warnings = append(result.Warnings, warning)
+	}
+	result.Warnings = append(result.Warnings, formulaWarnings...)
+	result.Warnings = append(result.Warnings, columnWarnings(
+		refNames, refPresent, refFilled, refUnits, numericRef, rowsMatched, *calc)...)
 	if nonNumeric > 0 {
+		// The denominator counts the cells that were read as numbers on
+		// purpose, so a mostly-text column does not make the ratio read as an
+		// alarm about the whole sheet.
+		numericCells := 0
+		for _, isNumeric := range numericRef {
+			if isNumeric {
+				numericCells++
+			}
+		}
 		result.Warnings = append(result.Warnings, fmt.Sprintf(
 			"%d of %d cells could not be read as numbers and were skipped",
-			nonNumeric, rowsMatched*max(1, len(refIndexes))))
+			nonNumeric, rowsMatched*max(1, numericCells)))
 	}
 	if warning := groupWarning(total, *limit); warning != "" {
 		result.Warnings = append(result.Warnings, warning)

@@ -23,6 +23,7 @@ python regress_agg.py          # 单跑某套
 | `regress_paging.py` | 4 种页大小遍历全表结果必须一致；页边界无缝衔接 | 分页丢行或重复行是最难发现的缺陷 |
 | `regress_new.py` | 合并单元格填充、`--header-row`、profile 统计量、TSV 版式 | 这些都与独立解析结果对账 |
 | `regress_precision.py` | 每一处与原始 XML 的数值差异都能被「15 位有效数字规范化」解释 | 区分"精度显示差异"与"读取错误" |
+| `regress_shapes.py` | `testdata/shapes.xlsx` 五张表：¥/% 数字格式、无缓存公式、跨行合并标签、含括号的列名、文本百分比列（49 项） | 既有夹具列名简单、无格式、无公式、无合并，这一整类"真实报表形状"原本无人覆盖——1.0.1 的静默错值全出在这里 |
 | `verify_docs.py` | 抽取 AGENTS.md / README.md 中所有 bash 命令**实际执行** | 文档漂移会让 agent 照着做然后开始猜 |
 | `regress_small.py` | 10 个小文件 × 7 个命令：零 panic、信封合法、数组字段非 null；含加密与损坏文件 | 首要不变量是"任何输入都不崩" |
 | `serve_mem.py` | 300 次请求内存收敛，切换文件不累积 | 验证 `serve` 可以长期挂着 |
@@ -34,6 +35,12 @@ Node.js 封装有自己的测试（`../nodejs/test.js`，33 项），`run_all.py
 `fixtures/header_row.xlsx` 是随套件一起提交的：一份标题块在表头上方的报表
 （第 1-2 行是标题与单位，第 3 行才是表头，第 4-6 行是数据），用于验证 `--header-row`。
 用 excelize 生成，形状即上述内容，需要重建时按这个结构写即可。
+
+`testdata/shapes.xlsx` 同样是提交进仓库的，供 `regress_shapes.py` 使用：五张表各一种形状
+（`格式` = ¥#,##0.00 金额列 + 0.00% 比率列；`公式` = openpyxl 写出的无缓存公式列；
+`合并` = A2:A3 的跨行标签；`括号列名` = `金额(万元)`；`文本百分比` = 值为 `"26.3%"` 的字符串列）。
+它由 openpyxl 生成（公式列必须**不带缓存值**，所以不能用 Excel 存），生成脚本不随仓库提交，
+形状即上述内容；`regress_shapes.py` 的期望值是**手写死**的，改夹具必须同步改期望。
 
 其余夹具来自仓库的 `test/` 目录。
 

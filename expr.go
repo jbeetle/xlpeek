@@ -83,6 +83,29 @@ func (n binaryNode) eval(lookup func(string) (float64, bool)) (float64, bool) {
 	return 0, false
 }
 
+// bracketHint names the escape when an expression failed because a column name
+// contains an operator character.
+//
+// "金额(万元)" is a column name a caller will meet in a real workbook, and an
+// expression parser necessarily reads the parenthesis as arithmetic. The fix —
+// writing [金额(万元)] — cannot be inferred from "unexpected "(" at position 6",
+// so it is spelled out instead.
+//
+// The hint is offered only when the input contains a character a name would
+// need the escape for and bracketing it in fact parses, so an ordinary typo
+// ("1+*2") stays a plain error rather than being answered with a suggestion to
+// make it a column name.
+func bracketHint(source string) string {
+	name := strings.TrimSpace(source)
+	if name == "" || !strings.ContainsAny(name, "()[] \t") {
+		return ""
+	}
+	if _, err := parseExpr("[" + name + "]"); err != nil {
+		return ""
+	}
+	return fmt.Sprintf("; if that is a column name, wrap it in brackets: [%s]", name)
+}
+
 // identifiers walks the tree collecting every variable name it references, so
 // that the caller can resolve them all up front instead of per row.
 func identifiers(n exprNode, seen map[string]bool) {

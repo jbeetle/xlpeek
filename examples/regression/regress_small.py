@@ -23,7 +23,8 @@ FAILURES = []
 KNOWN_CODES = {'USAGE', 'FILE_NOT_FOUND', 'SHEET_NOT_FOUND', 'INVALID_PASSWORD',
                'PASSWORD_REQUIRED', 'UNSUPPORTED_FORMAT', 'COLUMN_NOT_FOUND', 'READ_ERROR'}
 
-SMALL_FILES = ['BadWorkbook.xlsx', 'Book1.xlsx', 'CalcChain.xlsx', 'MergeCell.xlsx',
+SMALL_FILES = ['shapes.xlsx',
+               'BadWorkbook.xlsx', 'Book1.xlsx', 'CalcChain.xlsx', 'MergeCell.xlsx',
                'OverflowNumericCell.xlsx', 'SharedStrings.xlsx',
                'encryptAES.xlsx', 'encryptSHA1.xlsx', 'encryptSHA512.xlsx',
                'vbaProject.bin']

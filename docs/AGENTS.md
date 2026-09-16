@@ -26,8 +26,8 @@
 每次调用往 stdout 写且只写一个 JSON：
 
 ```json
-{"ok":true,"command":"read","version":"1.0.1","data":{ ... }}
-{"ok":false,"command":"read","version":"1.0.1","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
+{"ok":true,"command":"read","version":"1.0.2","data":{ ... }}
+{"ok":false,"command":"read","version":"1.0.2","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
 ```
 
 - **错误也在 stdout**，所以只有一个解析路径。先看 `ok`。
@@ -163,10 +163,18 @@ xlpeek agg book.xlsx -s 明细 --header --sum "净利=收入金额-成本金额"
 
 # 先过滤再汇总
 xlpeek agg book.xlsx -s 明细 --header --where "销售区域=华北" --sum 收入金额
+
+# 跨行合并的标签列 / 无缓存值的公式列
+xlpeek agg book.xlsx -s 明细 --header --group-by 销售区域 --sum 收入金额 --fill-merged
+xlpeek agg book.xlsx -s 明细 --header --sum 收入金额 --calc
 ```
 
 聚合函数：`--sum` `--avg` `--min` `--max` `--count` `--count-distinct`，
 每个都可用多次，都接受算术表达式（`+ - * /` 和括号），都可以用 `名字=表达式` 重命名。
+
+> **列名本身含运算符、括号或空格时，写成方括号**：`--sum "[金额(万元)]"`。
+> 中文报表里 `金额(万元)`、`收入(USD)` 这类列名很常见，不加方括号会被当成算术式而报错
+> ——报错信息里也会给出这个写法。
 
 `--derive "名字=表达式"` 基于**已算出的聚合字段**再算指标——比率必须这样做：
 `sum(收入-成本)/sum(收入)` 才是整体毛利率，逐行毛利率求平均是错的。
@@ -181,6 +189,15 @@ xlpeek agg book.xlsx -s 明细 --header --where "销售区域=华北" --sum 收�
 - `--sort-by` 对聚合字段是**降序**，对分组键是升序。`--limit`/`--offset` 对**输出分组**分页。
 - 无法解析为数字的单元格会被跳过。**跳过多少很重要**，所以警告里同时给出跳过数和总数
   （跳过 3 个和跳过 597 个是完全不同的信号），通过 `warning_count` 判断有没有发生。
+- **带数字格式的列按显示值参与计算**：`¥1,234.50`、`12.35%`（= 0.1235）都能直接求和，
+  默认模式与 `--raw` 得到同一个数。要在完整存储精度上算，仍用 `--raw`。
+- `--calc` 与 `--fill-merged` 的含义和 `read` 完全相同（求无缓存公式 / 把合并区值填进所跨单元格），
+  两者都会让 excelize 载入整张表，因此都是显式 opt-in。
+- **三条"数字对、前提错"的告警**（都在 `warnings` 里，都会让 `warning_count > 0`）：
+  引用的列**一个可用数值都没有**（聚合结果是 `null`；消息会区分"单元格是空的"——多半是
+  无缓存公式，提示 `--calc`——还是"有值但都是文本"，后者不要加 `--calc`）；
+  同一列**混用了多种货币**（每个单元格都能解析，总和依然没有意义）；
+  有行**分组键为空**（多半是合并标签列，消息里会提示 `--fill-merged`）。
 
 **⚠️ `unaccounted_columns` —— 务必检查这个字段。**
 
@@ -255,10 +272,17 @@ xlpeek serve
 ```bash
 xlpeek profile book.xlsx -s 明细 --header
 xlpeek profile book.xlsx -s 明细 --header --columns 销售区域,币种
+xlpeek profile book.xlsx -s 明细 --header --calc          # 无缓存公式列也能看出来
+xlpeek profile book.xlsx -s 明细 --header --fill-merged   # 合并标签列不再算作空
 ```
 
 逐列返回：`type`（`number`/`date`/`text`/`empty`/`mixed`）、填充率、`distinct` 去重数、
 数值列的 `min`/`max`/`mean`、以及基数低时的 `top_values`（取值 + 计数）。
+
+> **类型看的是单元格呈现出来的值**：`¥1,234.50`、`12.35%` 都算 `number`——数字格式只是
+> 存储值外面的一层装饰，不是另一种数据。但**带公式却没有缓存值的列**（openpyxl / pandas /
+> xlsxwriter 生成的表就是这样）默认会显示成 `empty`，加 `--calc` 才能正确归类；
+> **合并标签列**的填充率默认是失真的，加 `--fill-merged` 才是真实覆盖率。
 
 `top_values` 不存在时，看 `values_omitted` 区分原因，**不要假定"没列出 = 没有值"**：
 
@@ -307,8 +331,15 @@ xlpeek find book.xlsx -s 明细 -v "已取消" --header --column 状态 -l 20
 > 过滤值能解析成数字时走**数值比较**，此时**无法解析为数字的单元格直接判为不匹配**，
 > 而不会退化成文本比较。这个行为是有意的——避免"看起来有结果但其实是字符串比较"。
 >
-> 千分位逗号会被容忍，但**货币符号和 `%` 不会被剥离**。所以对格式化过的百分比列
-> （显示为 `25.67%`）做数值过滤必须配 `--raw`。
+> **"能解析成数字"包含数字格式带来的修饰**：千分位逗号、两侧的货币符号、以及结尾的
+> `%`。`%` 是**比例**（`20%` 就是 `0.2`），所以 `--where "比率>20%"` 不会命中显示为
+> `5.00%` 的单元格，阈值收紧到 `2%` 结果只会变少。
+>
+> **货币符号只当作装饰，不换算**：因此默认模式和 `--raw` 给出相同的过滤结果；同一列
+> 混用 `¥`/`$` 时按数值大小比较（这种混合由 `agg` 负责报出来）。
+>
+> 完全不是数字的值（`A-1`、`2024-08-21`）仍然按文本比较——日期区间过滤靠的就是这个。
+> **要在完整存储精度上比较，仍用 `--raw`**：默认模式下比较的是显示值。
 
 ---
 
@@ -349,7 +380,12 @@ xlpeek agg book.xlsx -s 明细 --header --group-by 单位,币种 --sum 收入金
 ```bash
 xlpeek info book.xlsx --deep          # 看 merged_ranges 是否 > 0
 xlpeek read book.xlsx -s 明细 --fill-merged
+xlpeek agg book.xlsx -s 明细 --header --group-by 销售区域 --sum 收入金额 --fill-merged
+xlpeek profile book.xlsx -s 明细 --header --fill-merged
 ```
+
+`read` / `agg` / `profile` 都支持这个 flag。`agg` 另外会在**有行落进空分组**时主动告警
+（提示 `--fill-merged`），所以即使不传也不会静默失真。
 
 ### 陷阱 3：表头不在第 1 行
 
@@ -393,6 +429,20 @@ xlpeek read book.xlsx -s 明细 --header --skip-empty
 
 同理，`columns_capped: true`（`info`）和 `distinct_capped: true`（`profile`）分别表示
 **列被截断**和**去重数只是下界**。
+
+### 陷阱 7：程序生成的表格里，公式列看起来是空的
+
+Excel 自己保存时会把公式的计算结果一并写进文件；openpyxl / pandas / xlsxwriter 生成的
+表**不写**。于是这些表的公式列读出来是空串，`agg --sum` 得到 `null`——而单元格里明明有公式。
+
+```bash
+xlpeek read book.xlsx -s 明细 --header --calc               # 求值后读出
+xlpeek agg book.xlsx -s 明细 --header --sum 收入金额 --calc
+xlpeek profile book.xlsx -s 明细 --header --calc
+```
+
+求值会让 excelize 载入整张表，所以默认关闭。但 `agg` 在"引用的列一个可用数值都没有"
+时会主动告警并提示 `--calc`，不会只回一个 `null` 让你去猜。
 
 ---
 
@@ -483,7 +533,9 @@ xlpeek agg     <f> [-s 表] [--header] [--group-by a,b]
                       [--sum e] [--avg e] [--min e] [--max e] [--count]
                       [--count-distinct c] [--derive "n=e"] [--where expr]
                       [--sort-by 字段] [--limit N] [--offset N]
+                      [--calc] [--fill-merged]
 xlpeek profile <f> [-s 表] [--header] [--columns a,b] [--max-values N] [--where expr]
+                      [--calc] [--fill-merged]
 xlpeek find    <f> [-s 表] -v 值 [--regex] [--ignore-case] [--column c]
                       [--header] [--header-row N] [-l N] [--max-scan N]
 xlpeek serve       [--cache N] [--idle-timeout 5m]
