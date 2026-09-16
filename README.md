@@ -112,15 +112,17 @@ runs on glibc, musl/Alpine and `FROM scratch` images alike.
 Cross-compile for wherever the caller runs:
 
 ```bash
-CGO_ENABLED=0 GOOS=linux  GOARCH=amd64 go build -trimpath -o bin/xlpeek-linux-amd64  .
-CGO_ENABLED=0 GOOS=linux  GOARCH=arm64 go build -trimpath -o bin/xlpeek-linux-arm64  .
-CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -o bin/xlpeek-darwin-arm64 .
-CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -o bin/xlpeek.exe .
+CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 go build -trimpath -buildvcs=false -o bin/xlpeek-linux-amd64  .
+CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 go build -trimpath -buildvcs=false -o bin/xlpeek-linux-arm64  .
+CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 go build -trimpath -buildvcs=false -o bin/xlpeek-darwin-arm64 .
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -buildvcs=false -o bin/xlpeek.exe .
 ```
 
-`-trimpath` keeps the build machine's own paths out of the binary and makes the
-result reproducible: same source and same Go version, same bytes. The binaries
-attached to a release are built with exactly these commands.
+`-trimpath` keeps the build machine's own paths out of the binary and
+`-buildvcs=false` keeps its git state out of it, so the build is reproducible:
+same source and same Go version, same bytes, whether the tree is clean or not.
+The binaries attached to a release are built with exactly these commands, and a
+rebuild from the release tag reproduces them.
 
 A binary is tied to one OS and architecture: a `.exe` will not run on Linux and
 vice versa. The cost of self-containment is size — roughly 14 MB per platform,
