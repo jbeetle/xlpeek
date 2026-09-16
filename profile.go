@@ -229,6 +229,8 @@ func cmdProfile(args []string) int {
 	headerFlag := fs.Bool("header", false, "treat row 1 as the header, so columns are named")
 	headerRow := fs.Int("header-row", 0, "worksheet row holding the column names; overrides --header")
 	skipEmpty := fs.Bool("skip-empty", false, "ignore rows whose cells are all empty")
+	calc := fs.Bool("calc", false, "evaluate formulas that have no cached value; loads the sheet into memory")
+	fillMerged := fs.Bool("fill-merged", false, "copy each merged region's value into every cell it spans; loads the sheet into memory")
 	maxValues := fs.Int("max-values", 20, "enumerate a column's values when it has at most this many; 0 disables")
 	maxColumns := fs.Int("max-columns", defaultMaxColumns, "cap on the number of columns profiled")
 	password := fs.String("password", "", "password for an encrypted workbook")
@@ -264,7 +266,7 @@ func cmdProfile(args []string) int {
 	if err != nil {
 		return fail("profile", err, *pretty)
 	}
-	defer func() { _ = f.Close() }()
+	defer releaseWorkbook(f)
 
 	sheetName, sheetIndex, err := resolveSheet(f, sheet)
 	if err != nil {
@@ -276,6 +278,16 @@ func cmdProfile(args []string) int {
 		return failWithSheet("profile", err, f.GetSheetList(), *pretty)
 	}
 	defer func() { _ = iter.Close() }()
+
+	// A merged label lives only in the top-left cell of its region, so without
+	// filling it in a profile reports the label column as barely filled and the
+	// rows it covers as carrying nothing.
+	var merges *mergeFiller
+	if *fillMerged {
+		if merges, err = newMergeFiller(f, sheetName); err != nil {
+			return failWithSheet("profile", err, f.GetSheetList(), *pretty)
+		}
+	}
 
 	headerAt := 0
 	if *headerFlag {
@@ -296,6 +308,9 @@ func cmdProfile(args []string) int {
 		wanted    []string
 		resolved  bool
 		budget    = distinctTotal
+		// Warnings raised while evaluating formulas, capped so a workbook full
+		// of broken ones cannot pad the response.
+		formulaWarnings []string
 	)
 	wanted = splitList(columns)
 
@@ -322,6 +337,9 @@ func cmdProfile(args []string) int {
 				if header, err = iter.Columns(); err != nil {
 					return failWithSheet("profile", err, f.GetSheetList(), *pretty)
 				}
+				if merges != nil {
+					header = merges.apply(pos, header, *maxColumns)
+				}
 				// Create a column for every named header, so that a column that
 				// is empty throughout is still reported as empty rather than
 				// vanishing from the profile.
@@ -332,6 +350,21 @@ func cmdProfile(args []string) int {
 		cells, err := iter.Columns()
 		if err != nil {
 			return failWithSheet("profile", err, f.GetSheetList(), *pretty)
+		}
+		if merges != nil {
+			cells = merges.apply(pos, cells, *maxColumns)
+		}
+		// A formula with no cached result reads as empty, which would type its
+		// column "empty" and hide it from the profile entirely; resolving one
+		// makes excelize load the whole worksheet, so it is opt-in.
+		if *calc {
+			var warnings []string
+			cells, warnings = fillFormulas(f, sheetName, pos, cells)
+			for _, warning := range warnings {
+				if len(formulaWarnings) < maxWarnings {
+					formulaWarnings = append(formulaWarnings, warning)
+				}
+			}
 		}
 		if !resolved {
 			if err = resolveFilters(filters, header); err != nil {
@@ -405,6 +438,7 @@ func cmdProfile(args []string) int {
 		}
 		result.Columns = append(result.Columns, profile)
 	}
+	result.Warnings = append(result.Warnings, formulaWarnings...)
 	if capped {
 		result.Warnings = append(result.Warnings, fmt.Sprintf(
 			"a column had more than %d distinct values, so its distinct count is a lower bound",

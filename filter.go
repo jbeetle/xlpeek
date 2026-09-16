@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // filter is one --where clause: a column reference, an operator and a literal
@@ -144,17 +145,76 @@ func compareNumeric(op string, a, b float64) bool {
 	return false
 }
 
-// parseNumber reports whether s looks like a plain number, tolerating the
-// thousands separators that formatted spreadsheet values often carry.
-// Currency symbols and percent signs are deliberately left alone: guessing at
-// them would silently change what a comparison means. Use --raw for exact
-// numeric filtering.
+// parseNumber reports whether s reads as a number, and returns its value.
 func parseNumber(s string) (float64, bool) {
-	s = strings.ReplaceAll(strings.TrimSpace(s), ",", "")
-	s = strings.ReplaceAll(s, " ", "")
-	if s == "" {
-		return 0, false
+	value, _, ok := parseNumberUnit(s)
+	return value, ok
+}
+
+// currencySymbols are the marks a number format can put in front of or behind a
+// value. Symbols only, deliberately: a three-letter code such as "CNY" could be
+// part of a word, and a cell that says USD is not proof that it holds money. The
+// signs are written as escapes because the two yen signs, U+00A5 and fullwidth
+// U+FFE5, are indistinguishable in a diff.
+const currencySymbols = "\u00a5\uffe5\u0024\u20ac\u00a3\u20a9\u20b9"
+
+// parseNumberUnit parses a value the way a spreadsheet presents it, and reports
+// the currency it was presented in.
+//
+// A number format is decoration on top of a stored number: "¥1,234.50" and
+// "12.35%" are how a workbook shows 1234.5 and 0.1235. Recognising that is what
+// keeps the default, formatted read path comparable and aggregatable instead of
+// treating every money column as text — the failure mode where a filter matches
+// nothing, or matches the wrong rows, without saying so.
+//
+// Two rules keep the tolerance from swallowing meaning. A percent sign is a
+// scale rather than decoration, so it divides: 12.35% is 0.1235, which is both
+// what the cell stores and what --raw reports. And at most one currency symbol
+// is accepted, on either side, so a text cell that merely mentions a currency
+// is still text.
+//
+// The symbol is returned rather than discarded because summing across two
+// currencies is exactly the kind of plausible-looking nonsense this tool exists
+// to catch: the caller can see that a column mixed ¥ and $ even though both
+// parsed.
+func parseNumberUnit(s string) (float64, string, bool) {
+	text := strings.TrimSpace(s)
+	// Thousands separators, plus the spaces a locale or a number format pads with.
+	for _, separator := range []string{",", " ", "\u00a0", "\u3000"} {
+		text = strings.ReplaceAll(text, separator, "")
 	}
-	n, err := strconv.ParseFloat(s, 64)
-	return n, err == nil
+	if text == "" {
+		return 0, "", false
+	}
+	scale := 1.0
+	if strings.HasSuffix(text, "%") {
+		text, scale = strings.TrimSuffix(text, "%"), 0.01
+	}
+	text, unit := trimCurrency(text)
+	if text == "" {
+		return 0, "", false
+	}
+	value, err := strconv.ParseFloat(text, 64)
+	if err != nil {
+		return 0, "", false
+	}
+	return value * scale, unit, true
+}
+
+// trimCurrency removes at most one currency symbol from either end of text,
+// leaving any sign in place, and reports which symbol it was. A leading sign is
+// stepped over first so that a negative amount is understood in both of the
+// forms a number format can produce: "-¥1,234.50" and "¥-1,234.50".
+func trimCurrency(text string) (string, string) {
+	head, sign := text, ""
+	if len(head) > 0 && (head[0] == '+' || head[0] == '-') {
+		sign, head = head[:1], head[1:]
+	}
+	if r, size := utf8.DecodeRuneInString(head); size > 0 && strings.ContainsRune(currencySymbols, r) {
+		return sign + head[size:], string(r)
+	}
+	if r, size := utf8.DecodeLastRuneInString(text); size > 0 && strings.ContainsRune(currencySymbols, r) {
+		return text[:len(text)-size], string(r)
+	}
+	return text, ""
 }

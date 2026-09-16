@@ -32,6 +32,7 @@ SUITES = [
     ("regress_precision.py", "15 位有效数字规范化"),
     ("regress_crosscheck.py", "CLI 与独立 XML 解析器逐格比对"),
     ("verify_docs.py", "文档中的命令可执行"),
+    ("regress_shapes.py", "真实表格形状（格式/公式/合并/括号列名/文本百分比）"),
     ("regress_small.py", "小文件鲁棒性（含加密与损坏文件）"),
     ("serve_mem.py", "serve 会话内存有界"),
 ]

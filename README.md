@@ -95,7 +95,7 @@ covers how it is meant to be *driven*, and how it is checked:
 | [docs/SYSTEM_PROMPT.md](docs/SYSTEM_PROMPT.md) | paste into an agent's system prompt | ~730 tokens |
 | [docs/AGENTS.md](docs/AGENTS.md) | the agent's reference, loaded on demand | ~6,400 tokens |
 | [examples/nodejs](examples/nodejs) | a Node wrapper and the stdio traps it avoids | |
-| [examples/regression](examples/regression) | ten cross-validation suites, `run_all.py` | |
+| [examples/regression](examples/regression) | eleven cross-validation suites, `run_all.py` | |
 
 The first two exist because an agent that does not know the traps will walk into
 them confidently — the units-and-currencies case above is not hypothetical, it
@@ -141,7 +141,7 @@ table after the envelope, so only the first line parses as JSON.
 ## Testing
 
 ```bash
-go test .            # 35 unit tests
+go test .            # 41 unit tests
 python examples/regression/run_all.py   # the suites below, ~75s
 ```
 
@@ -149,7 +149,7 @@ python examples/regression/run_all.py   # the suites below, ~75s
 [`examples/regression`](examples/regression) cover what unit tests cannot:
 **cross-validation against an independent XML parser**, behaviour on real and
 malformed files, and whether the commands written in these docs actually run.
-Ten suites, exit code is the verdict:
+Eleven suites, exit code is the verdict:
 
 | | |
 | --- | --- |
@@ -158,13 +158,16 @@ Ten suites, exit code is the verdict:
 | `regress_paging` | four page sizes must yield the same rows, with no gap or overlap |
 | `regress_new` | merged cells, `--header-row`, profile statistics, TSV layout |
 | `regress_precision` | every difference from the raw XML explained by 15-digit normalisation |
+| `regress_shapes` | the shapes a real report has — ¥/`%` formats, uncached formulas, merged labels, bracketed column names, percentage text |
 | `verify_docs` | every command in docs/AGENTS.md and this file, actually executed |
 | `regress_small` | ten files × seven commands: no panic, valid envelope, no null arrays |
 | `serve_mem` | memory converges over 300 requests |
 | `nodejs/test.js` | the Node wrapper and the maxBuffer behaviour it exists to avoid |
 
 Set `XLPEEK` to point them at a specific build; leave it unset and they pick
-`bin/xlpeek.exe` or `bin/xlpeek-linux-<arch>` for the platform.
+`bin/xlpeek.exe` or `bin/xlpeek-linux-<arch>` for the platform. The workbooks
+they read are committed under `testdata/` — `bin/` is not, so build first and the
+suites run on a fresh clone.
 
 ## Output contract
 
@@ -172,8 +175,8 @@ Every invocation writes **exactly one JSON envelope to stdout** and nothing
 else. This holds on the failure path too, so a caller has a single parse path.
 
 ```json
-{"ok":true,"command":"read","version":"1.0.1","data":{ ... }}
-{"ok":false,"command":"read","version":"1.0.1","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
+{"ok":true,"command":"read","version":"1.0.2","data":{ ... }}
+{"ok":false,"command":"read","version":"1.0.2","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
 ```
 
 Exit codes: `0` success, `1` runtime failure, `2` usage failure.
@@ -184,8 +187,8 @@ stderr is human-oriented noise, such as the flag package's own diagnostics.
 call, and it carries the copyright alongside the number:
 
 ```json
-{"ok":true,"command":"version","version":"1.0.1",
- "data":{"name":"xlpeek","version":"1.0.1",
+{"ok":true,"command":"version","version":"1.0.2",
+ "data":{"name":"xlpeek","version":"1.0.2",
          "copyright":"Copyright (c) 2026 henryyu@163.com. All rights reserved."}}
 ```
 
@@ -339,11 +342,17 @@ xlpeek agg book.xlsx -s 明细 --header --sum "净利=收入金额-成本金额"
 
 # Filter first.
 xlpeek agg book.xlsx -s 明细 --header --where "销售区域=华北" --sum 收入金额
+
+# A workbook written by a script: its formulas have no cached value.
+xlpeek agg book.xlsx -s 明细 --header --sum 收入金额 --calc
 ```
 
 Aggregates: `--sum`, `--avg`, `--min`, `--max`, `--count`, `--count-distinct`.
 Each accepts an arithmetic expression over columns (`+ - * /`, parentheses), and
-a leading `name=` renames the output field. Every one is repeatable.
+a leading `name=` renames the output field. Every one is repeatable. A column
+whose name contains an operator, a bracket or a space is written in brackets —
+`--sum "[金额(万元)]"` — because the parenthesis in the name would otherwise be
+read as arithmetic; getting it wrong says so and repeats the form.
 
 `--derive "name=expression"` computes a metric from the aggregate fields already
 computed, which is what ratios need: `sum(收入-成本)/sum(收入)` is the overall
@@ -365,6 +374,19 @@ Field naming is predictable: `sum_收入金额`, `avg_收入金额`, `distinct_�
   `--offset` page the resulting groups with the same `has_more`/`next_offset`
   contract as `read`.
 - Cells that cannot be read as numbers are skipped and counted in `warnings`.
+- A value is read the way the sheet presents it, so a `¥1,234.50` or `12.35%`
+  column aggregates without `--raw`, and the sum agrees with the one `--raw`
+  produces. Three warnings cover what that tolerance could otherwise hide: a
+  referenced column that produced **no** numbers at all — its aggregates are
+  `null`, and the message says whether the cells are empty (which is what a
+  formula with no cached result looks like, and points at `--calc`) or simply
+  hold text; a column that mixed currencies while being summed; and rows
+  summarised under an empty grouping key, which is what a merged label column
+  looks like and points at `--fill-merged`.
+- `--calc` and `--fill-merged` are accepted here too: the first evaluates
+  formulas that have no cached value, the second copies a merged region's label
+  into every row it spans. Both make excelize load the whole worksheet, so
+  neither is on by default.
 
 ### `profile` — what does each column actually contain?
 
@@ -378,7 +400,16 @@ error.
 xlpeek profile book.xlsx -s 明细 --header
 xlpeek profile book.xlsx -s 明细 --header --columns 销售区域,币种
 xlpeek profile book.xlsx -s 明细 --header --max-values 50
+xlpeek profile book.xlsx -s 明细 --header --calc          # resolve uncached formulas
+xlpeek profile book.xlsx -s 明细 --header --fill-merged   # count merged labels
 ```
+
+A type is read from the value the cell presents rather than from bare digits, so
+`¥1,234.50` and `12.35%` are `number` — a number format is decoration on a stored
+number, not a different kind of value. `--calc` and `--fill-merged` are accepted
+here for the same reason they are on `agg`: without them a formula column reads
+as `empty` and a merged label column as barely filled, and both are reported as
+though that were a property of the data.
 
 ```
   G  销售区域  type=text    填充=100.0% 去重=11
@@ -481,11 +512,21 @@ The column may be a header name (in `--header` mode), a column letter (`B`), or 
 1-based index (`2`). A header name wins over a letter, so a column literally
 named `A` is still addressable by name.
 
-Comparison is numeric when the filter value parses as a number; a cell that does
-not parse as a number then simply fails to match rather than falling back to text
-comparison. Thousands separators are tolerated; currency symbols and `%` are not
-stripped, because guessing at them would silently change what a comparison means.
-For exact numeric filtering on formatted columns, use `--raw`.
+Comparison is numeric as soon as the filter value reads as a number; a cell that
+does not read as one then fails to match rather than falling back to text
+comparison. "Reads as a number" includes what a number format puts around a
+value: thousands separators, one currency symbol on either side, and a trailing
+`%`, which divides — `--where "比率>20%"` compares against 0.2, so a cell showing
+`5.00%` does not match it, and tightening the threshold to `2%` can only ever
+shrink the result.
+
+A currency symbol is presentation only: it is stripped, never converted, so the
+default path and `--raw` answer the same question, and a column mixing symbols
+compares on magnitude alone — `agg` is where that mixture gets reported rather
+than passed on. Values that are not numbers at all — `A-1`, `2024-08-21` — still
+compare as text, which is what makes date ranges work. `--raw` remains the way to
+compare at full stored precision, since a formatted cell is compared as it is
+displayed.
 
 ## Header rows
 
@@ -510,11 +551,17 @@ confidently from them.
 ```bash
 xlpeek info book.xlsx --deep              # reports merged_ranges and a sample
 xlpeek read book.xlsx -s 明细 --fill-merged
+xlpeek agg book.xlsx -s 明细 --header --group-by 销售区域 --sum 收入金额 --fill-merged
+xlpeek profile book.xlsx -s 明细 --header --fill-merged
 ```
 
 `--fill-merged` copies each region's value into every cell it spans. Only blanks
-are filled, so a region can never overwrite real data. `--deep` surfaces merged
-regions because it is easy not to know they are there.
+are filled, so a region can never overwrite real data. `read`, `agg` and
+`profile` all accept it, because a merged label distorts all three: a page with
+blanks in it, a group filed under an empty key, a fill rate that is really a
+merge. `agg` names the empty group when it sees one, so the case is visible even
+without the flag. `--deep` surfaces merged regions because it is easy not to know
+they are there.
 
 ## Output formats
 
@@ -563,7 +610,7 @@ with embedded line breaks would otherwise corrupt the table.
 - `--calc` evaluates formulas that have no cached value, `--fill-merged` reads
   merged regions, and `info --deep` reports them. All three make excelize load
   the whole worksheet into memory, giving up the streaming profile — so they are
-  opt-in.
+  opt-in on every command that takes them (`read`, `agg`, `profile`).
 - `has_more` is exact when the end of the sheet is reached during the lookahead.
   If the lookahead exceeds 10,000 rows without a verdict (possible with a
   restrictive `--where`), it reports `has_more: true` together with
