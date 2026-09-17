@@ -1,0 +1,10 @@
+# Go sources are compiled as bytes, and the build id covers them: a checkout
+# whose .go files carry CRLF produces a different binary from one whose files
+# carry LF. Pinning them to LF makes `go build -trimpath -buildvcs=false`
+# reproduce the released binaries on any platform, which is a claim the release
+# notes make and a reviewer will check.
+#
+# Only the compiled files need this. Prose files are read by people, and the
+# module files are parsed rather than hashed into the build id — a CRLF go.mod
+# was measured to make no difference.
+*.go text eol=lf
