@@ -31,6 +31,11 @@ go vet ./...                     # CI gate
 go test -race -timeout 20m ./...  # what CI actually runs (3 OSes × Go 1.25/1.26)
 ```
 
+> `gofmt -l .` prints every `.go` file on a Windows checkout, because
+> `core.autocrlf` writes CRLF and gofmt wants LF. The gate is meaningful on CI
+> and on an LF checkout; locally, check the files you touched with
+> `gofmt -l $(git diff --name-only -- '*.go')` after stripping CR.
+
 Cross-compile (the shipped `bin/` artifacts):
 
 ```bash
@@ -43,10 +48,17 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o bin/xlpeek.exe .
 Behavioural suites (Python 3.7+; not part of `go test`):
 
 ```bash
-python examples/regression/run_all.py     # all eleven suites, ~80s, exit code is the verdict
+python examples/regression/run_all.py     # all twelve suites, ~90s, exit code is the verdict
 python examples/regression/regress_agg.py # one suite
 XLPEEK=/path/to/xlpeek python run_all.py  # test a specific build
 node examples/nodejs/test.js              # 33 Node-wrapper checks
+python examples/regression/make_fixtures.py  # rebuild testdata/round2.xlsx (needs openpyxl)
+```
+
+Packaging (the thing the last two review rounds asked for):
+
+```bash
+python scripts/package_release.py --test  # build 4 targets, assemble, run the suite in place, zip
 ```
 
 Suites resolve the binary as `$XLPEEK`, else `bin/xlpeek.exe` / `bin/xlpeek-linux-<arch>`, else
@@ -76,13 +88,14 @@ the stdlib `flag` package stops at the first positional.
 | File | Owns |
 | --- | --- |
 | `main.go` | dispatch, flag reordering, usage text, `version`/`copyright` constants |
-| `output.go` | the output contract: envelope, exit codes, error classification, `orderedRow`, TSV |
+| `output.go` | the output contract: envelope, exit codes, error classification, `orderedRow`, TSV/CSV/markdown |
 | `reader.go` | workbook open + session cache, sheet/column resolution, streaming paging, merges, formula fill |
 | `commands.go` | `info`, `read`, `find` |
 | `agg.go` | `agg`: grouping, aggregates, the comparability guardrail |
 | `profile.go` | `profile`: per-column type, fill rate, distinct values |
-| `filter.go` | `--where` parsing and matching |
+| `filter.go` | `--where` parsing (strict) and matching |
 | `expr.go` | arithmetic expression parser/evaluator shared by `agg` column and derive expressions |
+| `dates.go` | `--dates`: number-format inspection and date serialisation |
 | `serve.go` | the stdio line protocol and `ping` |
 
 ### The output contract (`output.go`)
@@ -131,7 +144,22 @@ These are the reason the code looks the way it does; preserve them when editing.
   group nor aggregate yet vary across the aggregated rows — the mixed-units/mixed-currency case
   where a total is arithmetically right and semantically meaningless. `isHazardName` flags names
   that look like units/currencies (Chinese substrings; English whole segments, so `unit_price`
-  fires but `opportunity` does not). Grouping beyond 1,000 groups without `--limit` warns.
+  fires but `opportunity` does not). Grouping beyond 1,000 groups without `--limit` warns, and
+  `--limit` itself now defaults to 1,000 (`aggDefaultGroupLimit`) so that accident costs a page
+  rather than a context window.
+- **A comparison that answers in text what was asked in numbers says so.** `filter.match` counts
+  every cell that read as a number while the filter value did not (`fallbacks`, reported by
+  `filterWarnings` in `read`/`agg`/`profile`), because that is the shape a mistyped numeric
+  literal takes and the rows it matches are unrelated to the question. Filter *syntax* errors are
+  rejected outright (`operatorAt`): one column, one operator, one value, quoting to escape.
+- **Exit 2 means editing the command could fix it.** `argumentFailure` carries its own error code
+  (`badColumn`) and `exitFor` turns it into the status; a missing file or an unreadable workbook
+  stays exit 1. Anything new that reports a *bad argument* should go through these, or callers
+  lose the only signal that separates "I asked wrong" from "the file is odd".
+- **Paging answers about content, not position.** `readPage`'s lookahead only counts a row that
+  holds something as "more to fetch", so a formatted-but-empty tail ends the scan instead of
+  producing blank pages with `complete: false`. `info --deep`'s `last_populated_row` is the
+  position a caller should plan against; `max_row` is the file's own hint.
 
 ### `serve` mode
 
@@ -145,14 +173,18 @@ response.
 
 ## Untracked local material
 
-`bugs/` is an untracked black-box review of the shipped 1.0.1 binary (dated 2026-09-16): a report,
-a ticket list (D1–D7), and a Python repro script. D1–D6 are fixed in 1.0.2 — `--where` no longer
-degrades to lexicographic comparison on formatted values, `profile` reads through number formats,
-a formula column that yields nothing is reported by `agg` instead of returning a bare `null`,
-`agg`/`profile` take `--calc` and `--fill-merged`, and the regression fixture was restored. D7 is
-about the binary-only delivery that predates this repository.
+`bugs/` holds the reviews, which are untracked: `round1/` is the black-box review of the shipped
+1.0.1 binary (2026-09-16, tickets D1–D7) and `round2/` the review of 1.0.2 (2026-09-17, fifteen
+findings P1-1…P3-5 plus D6/D7). Both are worth reading before changing `--where`, paging or the
+delivery: nearly everything in them is a case where the tool returned `ok: true` with an answer
+that was plausible and wrong.
 
-The repro script is useful as an acceptance test (`python bugs/repro_xlpeek_defects.py
+The round-1 repro script is usable as an acceptance test (`python bugs/round1/repro_xlpeek_defects.py
 bin/xlpeek.exe`), with one caveat: its D4 assertion runs `agg` **without** `--fill-merged` and
 expects merged labels to be filled anyway. Merge filling is opt-in on every command, so five of
 its six assertions pass and that one reports a failure by design.
+
+Every round-2 finding has a case in `examples/regression/regress_round2.py`, which is the
+tracked counterpart — when one of those tickets is reopened, extend that suite rather than
+re-running the review by hand. The reports themselves stay untracked because they describe a
+past binary, but the cases they produced are the part worth keeping.

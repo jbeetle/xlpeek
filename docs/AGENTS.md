@@ -26,14 +26,17 @@
 每次调用往 stdout 写且只写一个 JSON：
 
 ```json
-{"ok":true,"command":"read","version":"1.0.2","data":{ ... }}
-{"ok":false,"command":"read","version":"1.0.2","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
+{"ok":true,"command":"read","version":"1.0.3","data":{ ... }}
+{"ok":false,"command":"read","version":"1.0.3","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
 ```
 
 - **错误也在 stdout**，所以只有一个解析路径。先看 `ok`。
 - 输出是 **UTF-8**。若你用本地代码页解码，非 ASCII 会乱码。
 - 默认紧凑单行 JSON（省 token）。人类可读用 `--pretty`。
-- flag 放在文件路径前后都可以。
+- flag 放在文件路径前后都可以。取值写作 `--limit 10` 或 `--limit=10`；
+  布尔 flag 三种写法都行：`--ignore-case`、`--ignore-case=true`、`--ignore-case true`。
+- **退出码 2 = 改参数就能修**（列名不存在、表达式非法、sheet 不存在）；
+  **1 = 改参数没用**（文件不存在、不是工作簿、读取失败）。据此决定是重试还是换个问法。
 
 ### ⚠️ 上下文预算：每次响应都会报出自身大小
 
@@ -76,7 +79,7 @@
 
 | code | 含义 | 你应该做什么 |
 |---|---|---|
-| `SHEET_NOT_FOUND` | sheet 名不对 | **消息里已列出所有可用 sheet**，直接用正确的名字重试 |
+| `SHEET_NOT_FOUND` | sheet 名不对（也可能是索引越界） | **消息里已列出所有可用 sheet**，直接用正确的名字或索引重试 |
 | `COLUMN_NOT_FOUND` | 列名不对 | 消息里说明了期望格式。改用列字母或序号，或先跑 `profile` 看真实列名 |
 | `FILE_NOT_FOUND` | 路径不对 | 检查路径。Windows 路径注意分隔符 |
 | `PASSWORD_REQUIRED` | 文件加密了，但你没给密码 | 向用户索要密码后加 `--password` 重试 |
@@ -101,10 +104,18 @@ xlpeek info book.xlsx -s 明细 --sample 5  # 只看某张表，多看几行
 
 返回每张表的：`name`、`visible`、`dimension`、`max_row`/`max_column`、`header`（表头行）、
 `header_keys`（`--header` 模式下会产生的 JSON 键）、`column_names`（A/B/C…）、`sample_rows`。
-`--deep` 追加 `last_row`、`populated_rows`、`merged_ranges`。
+`--deep` 追加 `last_row`、`populated_rows`、`last_populated_row`、`merged_ranges`。
+
+> **要判断「数据到第几行结束」，看 `last_populated_row`。**
+> `max_row` 是文件自己的说法，会把「只有格式没有内容」的空行算进去（拖一个边框到第 200 行，
+> 它就报 200）；`last_row` 是扫描停在哪；`populated_rows` 是**计数**不是位置。
+> `last_populated_row` 才是最后一个有内容的行号，用它算分页边界。
 
 > `dimension` / `max_row` / `max_column` 来自文件自带的维度元素，**只是提示，可能不准**。
 > 真正可信的是 `header`、`column_names` 和实际读出来的行。
+
+**`-s` 也接受 sheet 序号**（从 0 开始，和 `info` 报的 `index`、`read` 报的 `sheet_index` 一致）。
+名字优先于序号，所以有张表真叫 `1` 时仍按名字选：`xlpeek read book.xlsx -s 0`。
 
 ### `read <file>` — 分页读取
 
@@ -118,6 +129,8 @@ xlpeek read book.xlsx -s 明细 --header --where "金额>10000" -l 50
 xlpeek read book.xlsx -s 明细 --header --skip-empty    # 跳过空行
 xlpeek read book.xlsx -s 明细 --header --fill-merged   # 合并单元格填值
 xlpeek read book.xlsx -s 明细 --header --format tsv -l 1000   # 最省 token
+xlpeek read book.xlsx -s 明细 --header --dates iso -l 1000    # 日期形态固定
+xlpeek read book.xlsx -s 明细 --header --columns "A:D"        # 列区间
 ```
 
 分页元数据是自驱动的：
@@ -137,6 +150,9 @@ xlpeek read book.xlsx -s 明细 --header --format tsv -l 1000   # 最省 token
 - **先看 `complete` 字段。** `complete: true` 表示你手上的就是全部；`false` 表示还
   有更多行。**不要**把 `complete: false` 的一页当成整张表来下结论。`find` 同理
   （对应 `truncated`）。
+- **`complete` 看的是内容，不是位置。** 表格末尾「只有格式没有内容」的空行不算数据，
+  所以最后一页会直接给 `complete: true`，不会让你翻一堆空白页。表格中间的空洞不受影响，
+  预读照样会跨过去。要更干净就用 `--skip-empty`。
 - **默认不假设表头。** `--header` 等价于 `--header-row 1`。
 - `--header` 模式下，空表头单元格用列字母代替，重复表头加 `_2` 后缀——**列名永远唯一**。
 - 行会**补齐到统一宽度**，页与页之间不会变形。`columns` 给出本页的列字母。
@@ -180,7 +196,21 @@ xlpeek agg book.xlsx -s 明细 --header --sum 收入金额 --calc
 `sum(收入-成本)/sum(收入)` 才是整体毛利率，逐行毛利率求平均是错的。
 引用不存在的字段会直接报 `USAGE` 错，不会静默返回 null。
 
-输出字段命名可预测：`sum_收入金额`、`avg_收入金额`、`distinct_客户编号`、`count`、以及 `--derive` 指定的名字。
+输出字段命名分两种，都可预测：
+
+| 写法 | 字段名 |
+|---|---|
+| `--sum 收入金额`（不命名） | `sum_收入金额` —— **加前缀** |
+| `--sum "收入=[金额(万元)]"`（自己命名） | `收入` —— **就是你给的名字，不加前缀** |
+
+`count` 固定叫 `count`。写了 `name=` 就别再按文档里的前缀去引用它——
+`--derive` 引用不存在的字段会报 `USAGE`，并且会告诉你正确的名字是什么。
+
+方括号列名产出的字段名也带方括号，`--derive` 里照抄即可：
+
+```bash
+xlpeek agg book.xlsx -s 明细 --header --sum "[金额(万元)]" --sum "[成本(万元)]" --derive "毛利率=(sum_[金额(万元)]-sum_[成本(万元)])/sum_[金额(万元)]"
+```
 
 **语义要点：**
 - **空单元格被跳过，不当 0 处理。** 所以均值不会被空值拉低。但表达式内部的空值按电子表格惯例算 0。
@@ -219,8 +249,8 @@ xlpeek agg book.xlsx -s 明细 --header --sum 收入金额 --calc
 
 **`complete` 字段**：`true` 表示这就是全部分组；`false` 表示还有更多，用 `next_offset` 继续。
 
-**⚠️ 高基数分组会退化成"倒表"。** `agg` 的 `--limit` 默认是 **0（不限）**，所以按近似唯一的列分组
-（凭证号、客户编号）会返回一行一组——那不是汇总，是换了形式的全表：
+**⚠️ 高基数分组会退化成"倒表"。** 按近似唯一的列分组（凭证号、客户编号）会返回一行一组
+——那不是汇总，是换了形式的全表：
 
 ```bash
 --group-by 销售区域     → 11 组     1.8 KB   正常
@@ -228,8 +258,10 @@ xlpeek agg book.xlsx -s 明细 --header --sum 收入金额 --calc
 --group-by 凭证号       → 2700 组   181 KB   ⚠️ 这就是全表
 ```
 
-分组数超过 1000 且你没给 `--limit` 时，工具会主动警告。**要"前 N 名"就用
-`--sort-by <字段> --limit N`**，不要先拉全量再自己截。
+`--limit` 默认 **1000**：超过就只回前 1000 组，并给 `has_more` / `next_offset` 让你接着取，
+同时在 `warnings` 里说明这是默认上限截的（不是你设的）。分组数超过 1000 时工具一定会出声。
+**要"前 N 名"就用 `--sort-by <字段> --limit N`**，不要先拉全量再自己截；
+真要全部就用 `--limit 0` 明说。
 
 ### `serve` — 长连接模式（同一文件问很多问题时用）
 
@@ -307,7 +339,16 @@ xlpeek find book.xlsx -s 明细 -v "已取消" --header --column 状态 -l 20
 ```
 
 返回每条命中的单元格坐标、行列号、所在列名、以及**整行上下文**。
-`truncated: true` 表示到达 `--limit`（或 `--max-scan`）而提前停止，**可能存在更多命中**——它不断言一定还有。
+
+`--offset` 数的是**命中数**（不是行数），配合 `next_offset` 续页，语义与 `read` 一致：
+
+```bash
+xlpeek find book.xlsx -s 明细 -v "已取消" --header -l 20 -o 20
+```
+
+`truncated: true` 表示**确实还有**下一条命中——工具会多找一条再下结论，所以最后一页是
+`truncated: false` / `complete: true`，不用靠"再翻一页看看"来确认。
+`truncated_approximate: true` 表示预读 1 万行仍没找到下一条就放弃了，此时是"可能有"。
 
 ---
 
@@ -328,8 +369,21 @@ xlpeek find book.xlsx -s 明细 -v "已取消" --header --column 状态 -l 20
 --where "客户名称~香港"
 ```
 
+> **一个条件只能有一个运算符。** 第一个运算符之后的内容全是值：`金额>>100`、
+> `金额>`、`金额>100>200` 一律报 `USAGE`（退出码 2），不再"尽力解释"。
+> 理由：以前这几条会成功返回行数——`金额>` 甚至匹配**全表**（空值比任何东西都大）
+> ——调用方看不出任何异常。
+>
+> 值里**真的**含 `> < = ~` 时用引号：`--where "备注~'a>b'"`。
+
 > 过滤值能解析成数字时走**数值比较**，此时**无法解析为数字的单元格直接判为不匹配**，
 > 而不会退化成文本比较。这个行为是有意的——避免"看起来有结果但其实是字符串比较"。
+>
+> **反过来要小心**：过滤值**不是**数字、而单元格是数字时，比较只能按文本做（日期区间
+> 靠的就是这个），于是 `--where "金额>1OO"`（数字 `0` 敲成字母 `O`）会得到一组
+> **看起来正常、其实完全无关**的行。这种情况现在一定告警：
+> `warning_count > 0`，且 `warnings` 里点明过滤值、列名、命中了多少个数值单元格。
+> **看到这个告警就说明这个过滤条件问的不是你想问的问题**，改用 `~` 或改对值。
 >
 > **"能解析成数字"包含数字格式带来的修饰**：千分位逗号、两侧的货币符号、以及结尾的
 > `%`。`%` 是**比例**（`20%` 就是 `0.2`），所以 `--where "比率>20%"` 不会命中显示为
@@ -340,6 +394,10 @@ xlpeek find book.xlsx -s 明细 -v "已取消" --header --column 状态 -l 20
 >
 > 完全不是数字的值（`A-1`、`2024-08-21`）仍然按文本比较——日期区间过滤靠的就是这个。
 > **要在完整存储精度上比较，仍用 `--raw`**：默认模式下比较的是显示值。
+>
+> **等值比较按 15 位有效数字**：`25.67%` 换算成 `0.2567` 时可能差一个 ulp，
+> 所以 `--raw --where "比率=25.67%"` 也能命中存储值为 `0.2567` 的单元格。
+> 范围比较（`>` `<`）本来就不受影响。
 
 ---
 
@@ -421,8 +479,9 @@ xlpeek read book.xlsx -s 明细 --header --skip-empty
 | 字段 | 出现位置 | 含义 |
 |---|---|---|
 | `complete: false` | `read` / `agg` / `find` | 还有更多，用 `next_offset` 继续 |
-| `truncated: true` | `find` | 达到 `--limit` 或 `--max-scan` 而停止 |
+| `truncated: true` | `find` | 达到 `--limit` 或 `--max-scan` 而停止（确实还有下一条） |
 | `has_more_approximate: true` | `read` | 预读超过 1 万行仍无法判断，`has_more` 是保守估计 |
+| `truncated_approximate: true` | `find` | 同上，`truncated` 是保守估计 |
 
 `has_more_approximate` 的偏保守是刻意的：错报 `false` 会让你漏数据，错报 `true` 只多一次
 请求。看到它时多翻一页确认，不要直接断定没有更多。
@@ -443,6 +502,37 @@ xlpeek profile book.xlsx -s 明细 --header --calc
 
 求值会让 excelize 载入整张表，所以默认关闭。但 `agg` 在"引用的列一个可用数值都没有"
 时会主动告警并提示 `--calc`，不会只回一个 `null` 让你去猜。
+
+### 陷阱 8：过滤值写错一个字符，问的就不是原来的问题
+
+`0` 与 `O`、`l` 与 `1` 这种误敲，会让过滤值不再是数字；此时比较只能按**文本**做，
+于是 `--where "金额>1OO"` 命中的是"按字符比大小"的那几行——**行数看起来很正常**，
+没有任何线索表明过滤没按数值生效。
+
+```bash
+xlpeek read book.xlsx -s 明细 --header --where "金额>1OO" -l 9
+# → ok:true，但 warning_count > 0，warnings 里点名 "1OO" 不是数字、多少个数值单元格被按文本比较
+```
+
+**`warning_count > 0` 就说明这个过滤条件问的不是你想问的问题**：要么改对值，
+要么本来就该用 `~` 做子串搜索。
+
+同理，`--where` 的表达式必须**恰好一个运算符**：`金额>>100`、`金额>`、`金额>100>200`
+现在一律报 `USAGE`，不再静默返回一个看似正常的行数。
+
+### 陷阱 9：日期形态随文件而变
+
+日期存的是数字、显示的是数字格式，所以同一个值在这个文件里是 `2026-01-01 0:00:00`、
+在那个文件里是 `01-01-26`，而 `--raw` 给的是 `46023`。`01-01-26` 对下游是**有歧义**的
+（月日顺序、两位年份），跨文件比较或排序之前先固定形态：
+
+```bash
+xlpeek read book.xlsx -s 明细 --header --dates iso -l 1000
+```
+
+`--dates iso` 给 `2026-01-01`（存了时刻则给 `2026-01-01T09:30:00`），
+`--dates serial` 给存储的数字。默认 `display` 保持文件原样——因为判断"哪些单元格是日期"
+必须读数字格式，那会载入整张表，所以和 `--calc` 一样是显式 opt-in。
 
 ---
 
@@ -530,30 +620,36 @@ TSV 模式第一行是 JSON 信封（含分页元数据），之后是表头行 
 ```bash
 xlpeek info    <f> [--deep] [-s 表] [--header-row N] [--sample N]
 xlpeek read    <f> [-s 表] [--header] [--header-row N] [-o N] [-l N]
-                      [--columns a,b] [--where expr] [--skip-empty]
-                      [--fill-merged] [--calc] [--raw] [--format tsv]
+                      [--columns a,b|A:D] [--where expr] [--skip-empty]
+                      [--fill-merged] [--calc] [--raw] [--dates iso|serial]
+                      [--format json|tsv|csv|markdown]
 xlpeek agg     <f> [-s 表] [--header] [--group-by a,b]
                       [--sum e] [--avg e] [--min e] [--max e] [--count]
                       [--count-distinct c] [--derive "n=e"] [--where expr]
                       [--sort-by 字段] [--limit N] [--offset N]
                       [--calc] [--fill-merged]
-xlpeek profile <f> [-s 表] [--header] [--columns a,b] [--max-values N] [--where expr]
+xlpeek profile <f> [-s 表] [--header] [--columns a,b|A:D] [--max-values N] [--where expr]
                       [--calc] [--fill-merged]
 xlpeek find    <f> [-s 表] -v 值 [--regex] [--ignore-case] [--column c]
-                      [--header] [--header-row N] [-l N] [--max-scan N]
+                      [--header] [--header-row N] [-l N] [-o N] [--max-scan N]
+                      [--dates iso|serial]
 xlpeek serve       [--cache N] [--idle-timeout 5m]
 xlpeek ping
 
-通用：[--sheet/-s 表] [--raw] [--password P] [--tmpdir D] [--pretty]
+通用：[-s 表名或序号] [--raw] [--password P] [--tmpdir D] [--pretty]
 
 约定值：read 的 --limit 默认 100、上限 5000；find 的 --limit 默认 50；
-        --max-columns 默认 128；profile 的 --max-values 默认 20。
+        agg 的 --limit 默认 1000（0 = 不限）；--max-columns 默认 128；
+        profile 的 --max-values 默认 20。
         超出范围会直接报 USAGE 错，不会静默截断。
+
+退出码：0 成功；2 = 改参数就能修（列名/sheet 不存在、表达式非法）；
+        1 = 改参数没用（文件不存在、不是工作簿、读取失败）。
 
 必查字段：complete（是否完整）、warning_count（必须为 0 才能直接报数字）、
          warnings（> 0 时**逐条读**：同一列混用多种货币、有行落进空分组、
-         引用的列没有任何可用数值——这三类都是"数字可能没有意义"的信号，
-         先按消息里的提示处理，再报数字）、
+         引用的列没有任何可用数值、过滤值不是数字却被按文本比较——
+         这四类都是"结果可能不是你要的"的信号，先按消息里的提示处理再下结论）、
          unaccounted_columns（汇总时是否有未计入的可疑维度列）、
          data_bytes / data_warning（响应多大，是否该收窄查询）
 ```

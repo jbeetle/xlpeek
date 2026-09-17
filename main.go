@@ -25,7 +25,7 @@ import (
 
 const (
 	tool    = "xlpeek"
-	version = "1.0.2"
+	version = "1.0.3"
 	// Copyright holder, reported by the version command and carried as the
 	// header of every source file in this command.
 	author    = "henryyu@163.com"
@@ -127,7 +127,18 @@ func reorderArgs(fs *flag.FlagSet, args []string) []string {
 			continue // unknown flag: let Parse produce the error
 		}
 		if boolean, ok := declared.Value.(boolFlag); ok && boolean.IsBoolFlag() {
-			continue // a boolean flag never takes a separate value
+			// A boolean flag does not take a separate value, which is not
+			// visible from the outside: "--ignore-case true" reads as correct
+			// to anyone who has not memorised the flag package, and the "true"
+			// then fell through to the operand list, where it was reported as a
+			// stray workbook path — sending the caller to check a path that was
+			// never the problem. The two words a boolean can be set to are
+			// accepted as its value so that the natural spelling works.
+			if i+1 < len(args) && isBoolWord(args[i+1]) {
+				i++
+				flags = append(flags, arg+"="+args[i])
+			}
+			continue
 		}
 		if i+1 < len(args) {
 			i++
@@ -135,6 +146,33 @@ func reorderArgs(fs *flag.FlagSet, args []string) []string {
 		}
 	}
 	return append(flags, operands...)
+}
+
+// isBoolWord reports whether a token is one of the two words a boolean flag can
+// be set to. Only the words: "1" and "0" are also accepted by the flag package
+// for a boolean, and treating those as values would swallow an operand — a
+// sheet index, a file called 1 — that the caller meant literally.
+func isBoolWord(token string) bool {
+	return strings.EqualFold(token, "true") || strings.EqualFold(token, "false")
+}
+
+// operandError reports a command invoked with the wrong number of positional
+// arguments.
+//
+// It names what it received, because the usual cause is a token that was meant
+// as a value rather than as a path: "expected exactly one workbook path" does
+// not say which argument was taken for one, and a caller reads it as an
+// instruction to check a path that is perfectly fine.
+func operandError(command string, operands []string, want string) int {
+	if len(operands) == 0 {
+		return failUsage(command, fmt.Sprintf("expected %s, got none", want))
+	}
+	quoted := make([]string, len(operands))
+	for i, operand := range operands {
+		quoted[i] = fmt.Sprintf("%q", operand)
+	}
+	return failUsage(command, fmt.Sprintf(
+		"expected %s, got %d: %s", want, len(operands), strings.Join(quoted, " ")))
 }
 
 // parseFlags parses args and returns the positional operands. A usage error is

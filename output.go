@@ -8,6 +8,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -97,6 +98,44 @@ type cliError struct {
 	Message string `json:"message"`
 }
 
+// argumentFailure marks a failure that is about the arguments rather than the
+// workbook: a column that is not there, a sheet that does not exist, an
+// expression that does not parse.
+//
+// The distinction is the one the exit status exists to draw. A caller that
+// treats every non-zero exit as "the file is odd, try again" will retry a
+// misspelled column name forever; the status says which of the two it is
+// holding. The code travels with the error rather than being re-derived at the
+// reporting site, so that a column reference is reported as COLUMN_NOT_FOUND
+// whether it was named by --columns, by --where or by --group-by.
+type argumentFailure struct {
+	code string
+	err  error
+}
+
+func (e *argumentFailure) Error() string { return e.err.Error() }
+func (e *argumentFailure) Unwrap() error { return e.err }
+
+// badColumn tags a failed column reference.
+func badColumn(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &argumentFailure{code: codeColumnNotFound, err: err}
+}
+
+// exitFor reports the status a failure should end with: 2 when editing the
+// command is what would fix it, 1 when the command was fine and the workbook,
+// the path or the environment was not.
+func exitFor(err error) int {
+	var argument *argumentFailure
+	var notExist excelize.ErrSheetNotExist
+	if errors.As(err, &argument) || errors.As(err, &notExist) {
+		return exitUsage
+	}
+	return exitError
+}
+
 // orderedRow marshals as a JSON object that preserves worksheet column order.
 // A plain map would be sorted alphabetically by encoding/json, which scrambles
 // the columns for anyone reading the output. Values are untyped so that an
@@ -172,13 +211,14 @@ func respondOK(command string, data interface{}, pretty bool) int {
 	return exitOK
 }
 
-// respondTSV writes the envelope followed by a tab-separated body.
+// respondWithBody writes the envelope followed by a rendered table.
 //
 // The envelope still comes first and still carries the paging metadata, so a
 // caller keeps one control-flow path (read line 1, follow next_offset) while
 // the rows themselves avoid JSON's per-row quoting and repeated keys. Those
-// two are what make tabular output materially cheaper to feed to a model.
-func respondTSV(command string, data interface{}, body string, pretty bool) int {
+// two are what make a tabular body materially cheaper to feed to a model,
+// whichever of the table formats it is written in.
+func respondWithBody(command string, data interface{}, body string, pretty bool) int {
 	encoded, err := marshalNoEscape(data)
 	if err != nil {
 		return respondErr(command, codeRead,
@@ -231,6 +271,65 @@ func buildTSV(names []string, rows [][]string) string {
 	return buf.String()
 }
 
+// buildCSV renders the table as comma-separated values, quoting the way RFC
+// 4180 does.
+//
+// The quoting is delegated rather than hand-rolled because it is the part that
+// bites: a remark column holding a comma, a quote or a line break is exactly
+// what a finance export contains, and a reader that splits on commas is the
+// thing most likely to consume this.
+func buildCSV(names []string, rows [][]string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	var buf bytes.Buffer
+	writer := csv.NewWriter(&buf)
+	_ = writer.Write(names)
+	for _, row := range rows {
+		_ = writer.Write(row)
+	}
+	writer.Flush()
+	return buf.String()
+}
+
+// buildMarkdown renders the table as a GitHub-style markdown table, which is
+// what a caller pastes into a report or an issue rather than parsing.
+func buildMarkdown(names []string, rows [][]string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	var buf strings.Builder
+	writeRow := func(cells []string) {
+		buf.WriteByte('|')
+		for _, cell := range cells {
+			buf.WriteByte(' ')
+			buf.WriteString(markdownCell(cell))
+			buf.WriteString(" |")
+		}
+		buf.WriteByte('\n')
+	}
+	writeRow(names)
+	rule := make([]string, len(names))
+	for i := range rule {
+		rule[i] = "---"
+	}
+	writeRow(rule)
+	for _, row := range rows {
+		writeRow(row)
+	}
+	return buf.String()
+}
+
+// markdownCell keeps a value inside its cell. A literal pipe would end the cell
+// early and shift every column after it, and a line break would end the row.
+func markdownCell(s string) string {
+	s = strings.ReplaceAll(s, "|", `\|`)
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	return s
+}
+
 func respondErr(command, code, message string, pretty bool, exitCode int) int {
 	writeEnvelope(envelope{
 		OK:      false,
@@ -251,8 +350,11 @@ func classify(err error) (string, string) {
 	if err == nil {
 		return "", ""
 	}
+	var argument *argumentFailure
 	var notExist excelize.ErrSheetNotExist
 	switch {
+	case errors.As(err, &argument):
+		return argument.code, err.Error()
 	case errors.As(err, &notExist):
 		return codeSheetNotFound, err.Error()
 	case errors.Is(err, os.ErrNotExist):
@@ -273,7 +375,7 @@ func classify(err error) (string, string) {
 
 func fail(command string, err error, pretty bool) int {
 	code, message := classify(err)
-	return respondErr(command, code, message, pretty, exitError)
+	return respondErr(command, code, message, pretty, exitFor(err))
 }
 
 // failWithSheet reports err, expanding a missing-sheet error with the list of
@@ -284,7 +386,7 @@ func failWithSheet(command string, err error, sheets []string, pretty bool) int 
 	if errors.As(err, &notExist) {
 		return respondErr(command, codeSheetNotFound, fmt.Sprintf(
 			"sheet %q not found; available sheets: %s",
-			notExist.SheetName, strings.Join(sheets, ", ")), pretty, exitError)
+			notExist.SheetName, strings.Join(sheets, ", ")), pretty, exitFor(err))
 	}
 	return fail(command, err, pretty)
 }

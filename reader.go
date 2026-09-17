@@ -199,10 +199,16 @@ func openWorkbook(path string, o workbookOptions) (*excelize.File, error) {
 	return f, nil
 }
 
-// resolveSheet maps a possibly empty or case-mismatched sheet name onto the
-// canonical name and index used by the workbook. An empty name selects the
-// first sheet, which is what an agent wants when it has not looked at the
-// workbook yet.
+// resolveSheet maps a possibly empty, case-mismatched or numeric sheet
+// reference onto the canonical name and index used by the workbook. An empty
+// reference selects the first sheet, which is what an agent wants when it has
+// not looked at the workbook yet.
+//
+// A number is an index into the sheet list, counted from zero because that is
+// what the index and sheet_index fields of info and read already report — a
+// caller who has seen "index": 0 has the number in hand and should not have to
+// convert it to a name. It is matched only after the names, so a workbook with
+// a sheet literally called "2" still reaches it by name.
 func resolveSheet(f *excelize.File, name string) (string, int, error) {
 	sheets := f.GetSheetList()
 	if len(sheets) == 0 {
@@ -221,6 +227,14 @@ func resolveSheet(f *excelize.File, name string) (string, int, error) {
 			return sheet, i, nil
 		}
 	}
+	if index, err := strconv.Atoi(strings.TrimSpace(name)); err == nil {
+		if index >= 0 && index < len(sheets) {
+			return sheets[index], index, nil
+		}
+		// Reported through the missing-sheet path so that the caller is handed
+		// the list of sheets — and, with it, the range the index had to be in.
+		return "", -1, excelize.ErrSheetNotExist{SheetName: name}
+	}
 	return "", -1, excelize.ErrSheetNotExist{SheetName: name}
 }
 
@@ -231,7 +245,7 @@ func resolveSheet(f *excelize.File, name string) (string, int, error) {
 func resolveColumn(ref string, header []string) (int, error) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
-		return -1, errors.New("empty column reference")
+		return -1, badColumn(errors.New("empty column reference"))
 	}
 	// Header cells are compared trimmed, because that is how they are reported:
 	// a sheet whose header reads "    名称" is listed by info as "名称", and a
@@ -250,14 +264,14 @@ func resolveColumn(ref string, header []string) (int, error) {
 	}
 	if n, err := strconv.Atoi(ref); err == nil {
 		if n < 1 {
-			return -1, fmt.Errorf("column index %d is 1-based and must be positive", n)
+			return -1, badColumn(fmt.Errorf("column index %d is 1-based and must be positive", n))
 		}
 		return n - 1, nil
 	}
 	if n, err := excelize.ColumnNameToNumber(ref); err == nil {
 		return n - 1, nil
 	}
-	return -1, fmt.Errorf("column %q matches no header name, column letter or index", ref)
+	return -1, badColumn(fmt.Errorf("column %q matches no header name, column letter or index", ref))
 }
 
 // columnLetter returns the spreadsheet column name for a 1-based column
@@ -323,12 +337,14 @@ type sheetScan struct {
 	header    []string
 	sample    [][]string
 	maxColumn int
-	// lastRow and populatedRows are only meaningful for a deep scan. A shallow
-	// scan stops once it has the sample, so reporting those numbers would hand
-	// a caller a row count that is really just where the scan happened to stop.
-	deep          bool
-	lastRow       int
-	populatedRows int
+	// lastRow, populatedRows and lastPopulatedRow are only meaningful for a
+	// deep scan. A shallow scan stops once it has the sample, so reporting
+	// those numbers would hand a caller a row count that is really just where
+	// the scan happened to stop.
+	deep             bool
+	lastRow          int
+	populatedRows    int
+	lastPopulatedRow int
 }
 
 // scanSheet walks a worksheet in streaming order. When deep is false it stops
@@ -361,6 +377,7 @@ func scanSheet(f *excelize.File, sheet string, headerRow, sampleRows int, deep b
 		}
 		if nonEmpty(cells) {
 			scan.populatedRows++
+			scan.lastPopulatedRow = pos
 		}
 		if pos >= firstDataRow && len(scan.sample) < sampleRows {
 			scan.sample = append(scan.sample, cells)
@@ -525,6 +542,7 @@ type pageRequest struct {
 	skipEmpty  bool
 	calc       bool
 	fillMerged bool
+	dates      string
 	maxColumns int
 }
 
@@ -571,11 +589,25 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 		skipped int
 		probe   int
 		merges  *mergeFiller
+		dates   *dateResolver
+		held    *excelize.Rows
 	)
 	if req.fillMerged {
 		if merges, err = newMergeFiller(f, req.sheet); err != nil {
 			return nil, err
 		}
+	}
+	if req.dates != datesDisplay {
+		// Two iterators walk the same worksheet in step when the date cells
+		// have to be rewritten: one yields what the sheet displays and the
+		// other the number it stores, and writing a date in a stable form needs
+		// both — the display to know the format's intent, the stored value to
+		// have something to reformat.
+		dates = newDateResolver(f, req.dates)
+		if held, err = f.Rows(req.sheet); err != nil {
+			return nil, err
+		}
+		defer func() { _ = held.Close() }()
 	}
 	applyMerges := func(row int, cells []string) []string {
 		if merges == nil {
@@ -586,6 +618,18 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 
 	for iter.Next() {
 		pos++
+		var stored []string
+		if held != nil {
+			if held.Next() {
+				// The stored number is asked for per call rather than inherited
+				// from how the workbook was opened: the row below needs the
+				// displayed value whatever --raw says, and this one needs the
+				// number behind it either way.
+				if stored, err = held.Columns(excelize.Options{RawCellValue: true}); err != nil {
+					return nil, err
+				}
+			}
+		}
 		if pos < firstDataRow {
 			if req.headerRow > 0 && pos == req.headerRow {
 				if res.header, err = iter.Columns(); err != nil {
@@ -609,6 +653,12 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 			if cells, warnings = fillFormulas(f, req.sheet, pos, cells); len(warnings) > 0 {
 				res.warnings = append(res.warnings, warnings...)
 			}
+		}
+		// Dates are rewritten before anything reads the row, so that a filter
+		// compares the values the caller will see rather than the ones the file
+		// happened to display.
+		if dates != nil {
+			cells = dates.apply(req.sheet, pos, cells, stored)
 		}
 		if len(res.rows) == req.limit {
 			// The page is complete. Keep going, but only to establish whether
@@ -636,6 +686,21 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 			continue
 		}
 		if len(res.rows) >= req.limit {
+			// The page is full, so what remains is decided here. Whether there
+			// is more to fetch is a question about content rather than about
+			// position: a worksheet's last rows are routinely formatted and
+			// empty (a stray border, a fill, a validation list dragged down),
+			// and treating position as the answer made a caller page through
+			// blank pages that never ended, with complete:false withheld for
+			// rows that hold nothing.
+			//
+			// A blank row does not end the scan outright — real sheets have
+			// gaps in the middle — it just does not count as more to fetch. The
+			// bounded lookahead above still applies, so a gap deeper than the
+			// cap reports has_more_approximate rather than scanning forever.
+			if !nonEmpty(cells) {
+				continue
+			}
 			res.hasMore = true
 			break
 		}
@@ -648,6 +713,9 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 	if err = iter.Error(); err != nil {
 		return nil, err
 	}
+	// A filter that answered in text something the caller asked in numbers says
+	// so here, once, rather than in the result set where it cannot be seen.
+	res.warnings = append(res.warnings, filterWarnings(req.filters)...)
 
 	// Pad every row to a common width so the page has a stable shape. The
 	// width comes from the rows actually returned rather than from the

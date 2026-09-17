@@ -81,7 +81,10 @@ a confident wrong answer.
 - **No `null` where an array belongs.** Iterating `rows` is always safe.
 - **Errors that correct the caller.** A bad sheet name comes back with the list
   of real ones; a bad column with the format expected; a cold call with the
-  field name to rename.
+  field name to rename; a mistyped aggregate name with the one you meant.
+- **Exit codes that mean something.** `2` when editing the command would fix it,
+  `1` when it would not — so a caller can tell "I asked wrong" from "the file is
+  odd" without parsing the message.
 - **`serve` mode.** One process, many questions, workbooks parsed once —
   measured at ~2 ms per query against ~265 ms for a fresh process.
 
@@ -95,7 +98,7 @@ covers how it is meant to be *driven*, and how it is checked:
 | [docs/SYSTEM_PROMPT.md](docs/SYSTEM_PROMPT.md) | paste into an agent's system prompt | ~850 tokens |
 | [docs/AGENTS.md](docs/AGENTS.md) | the agent's reference, loaded on demand | ~7,400 tokens |
 | [examples/nodejs](examples/nodejs) | a Node wrapper and the stdio traps it avoids | |
-| [examples/regression](examples/regression) | eleven cross-validation suites, `run_all.py` | |
+| [examples/regression](examples/regression) | twelve cross-validation suites, `run_all.py` | |
 
 The first two exist because an agent that does not know the traps will walk into
 them confidently — the units-and-currencies case above is not hypothetical, it
@@ -124,6 +127,31 @@ same source and same Go version, same bytes, whether the tree is clean or not.
 The binaries attached to a release are built with exactly these commands, and a
 rebuild from the release tag reproduces them.
 
+### The release bundle
+
+A binary on its own cannot be checked: the regression suites need the fixtures
+they measure against, and a checksum needs something to be a checksum *of*. A
+release is therefore assembled rather than collected by hand:
+
+```bash
+python scripts/package_release.py --test
+```
+
+That builds the four targets with the flags above, copies in `testdata/`, the
+suites, the docs and the licence, **runs the whole suite against the assembled
+copies**, and writes a `SHA256SUMS` over everything shipped. Unpack it anywhere
+and `sha256sum -c SHA256SUMS` verifies it; run
+`python examples/regression/run_all.py` inside it and the twelve suites run off
+the bundled binary and the bundled fixtures, with nothing to install.
+
+### Provenance
+
+The project's home and Go module path is
+[`github.com/jbeetle/xlpeek`](https://github.com/jbeetle/xlpeek); the copyright
+holder named in the binaries and in `LICENSE` is `henryyu@163.com`, who publishes
+under that account. They are the same origin, and the whole thing is MIT
+licensed — one author, one repository, one licence.
+
 A binary is tied to one OS and architecture: a `.exe` will not run on Linux and
 vice versa. The cost of self-containment is size — roughly 14 MB per platform,
 because the runtime is baked in rather than shared. That also means a Go
@@ -147,7 +175,7 @@ table after the envelope, so only the first line parses as JSON.
 ## Testing
 
 ```bash
-go test .            # 41 unit tests
+go test .            # 51 unit tests
 python examples/regression/run_all.py   # the suites below, ~75s
 ```
 
@@ -155,7 +183,7 @@ python examples/regression/run_all.py   # the suites below, ~75s
 [`examples/regression`](examples/regression) cover what unit tests cannot:
 **cross-validation against an independent XML parser**, behaviour on real and
 malformed files, and whether the commands written in these docs actually run.
-Eleven suites, exit code is the verdict:
+Twelve suites, exit code is the verdict:
 
 | | |
 | --- | --- |
@@ -165,6 +193,7 @@ Eleven suites, exit code is the verdict:
 | `regress_new` | merged cells, `--header-row`, profile statistics, TSV layout |
 | `regress_precision` | every difference from the raw XML explained by 15-digit normalisation |
 | `regress_shapes` | the shapes a real report has — ¥/`%` formats, uncached formulas, merged labels, bracketed column names, percentage text |
+| `regress_round2` | one case per finding of the second external review, most of them asserting the *error* |
 | `verify_docs` | every command in docs/AGENTS.md and this file, actually executed |
 | `regress_small` | ten files × seven commands: no panic, valid envelope, no null arrays |
 | `serve_mem` | memory converges over 300 requests |
@@ -175,17 +204,28 @@ Set `XLPEEK` to point them at a specific build; leave it unset and they pick
 they read are committed under `testdata/` — `bin/` is not, so build first and the
 suites run on a fresh clone.
 
+The suites check the delivery before they check the tool: a missing fixture or an
+unrunnable binary is reported once, by name, instead of failing every assertion
+with `FILE_NOT_FOUND`. One fixture is generated rather than hand-made —
+`python examples/regression/make_fixtures.py` rebuilds `testdata/round2.xlsx`
+from the description of its sheets (it needs openpyxl; the suites themselves do
+not) — so a fixture whose shape is questioned can be re-derived.
+
 ## Output contract
 
 Every invocation writes **exactly one JSON envelope to stdout** and nothing
 else. This holds on the failure path too, so a caller has a single parse path.
 
 ```json
-{"ok":true,"command":"read","version":"1.0.2","data":{ ... }}
-{"ok":false,"command":"read","version":"1.0.2","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
+{"ok":true,"command":"read","version":"1.0.3","data":{ ... }}
+{"ok":false,"command":"read","version":"1.0.3","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
 ```
 
-Exit codes: `0` success, `1` runtime failure, `2` usage failure.
+Exit codes: `0` success, `1` runtime failure, `2` usage failure. The distinction
+is whether editing the command could fix it: a column that does not exist, a
+filter that does not parse and a sheet that is not there are all `2`, because
+retrying them unchanged cannot help. A missing file or a file that is not a
+workbook is `1`, because the command was fine and the environment was not.
 
 Errors go to stdout rather than stderr for exactly that reason. Anything on
 stderr is human-oriented noise, such as the flag package's own diagnostics.
@@ -193,8 +233,8 @@ stderr is human-oriented noise, such as the flag package's own diagnostics.
 call, and it carries the copyright alongside the number:
 
 ```json
-{"ok":true,"command":"version","version":"1.0.2",
- "data":{"name":"xlpeek","version":"1.0.2",
+{"ok":true,"command":"version","version":"1.0.3",
+ "data":{"name":"xlpeek","version":"1.0.3",
          "copyright":"Copyright (c) 2026 henryyu@163.com. All rights reserved."}}
 ```
 
@@ -251,6 +291,13 @@ summary. Neither changes the result; both are there to be noticed.
 
 ## Commands
 
+Flags may come before or after the file. A value-taking flag takes either
+`--limit 10` or `--limit=10`. A boolean flag is set by being present, and accepts
+all three spellings — `--ignore-case`, `--ignore-case=true`, and
+`--ignore-case true` — because the last one is what almost everyone writes first,
+and having it land in the operand list produced an error about a workbook path
+that was never the problem.
+
 ### `info` — what is in this workbook?
 
 Cheap by default: it reads the dimension element and a short preview, not the
@@ -266,9 +313,16 @@ xlpeek info book.xlsx -s 明细 --sample 5
 Per sheet it reports `index`, `id`, `name`, `visible`, `dimension`, `max_row`,
 `max_column`, the `header` row, `header_keys` (the JSON keys `--header` would
 produce), `column_names`, and `sample_rows`. `--deep` adds `last_row`,
-`populated_rows`, `merged_ranges` and `merged_sample`, and sets `scanned: true`;
-without it those are absent rather than wrong, because a shallow scan stops
-early and any number it reported would just be where it stopped.
+`populated_rows`, `last_populated_row`, `merged_ranges` and `merged_sample`, and
+sets `scanned: true`; without it those are absent rather than wrong, because a
+shallow scan stops early and any number it reported would just be where it
+stopped.
+
+`last_populated_row` is the row number of the last row holding anything, and it
+is the number to plan paging with: `max_row` is the file's own claim and counts
+formatted empty rows, `last_row` is where the scan stopped, and `populated_rows`
+is a count rather than a position. It also names the sheet by index, so
+`xlpeek read book.xlsx -s 0` reaches the first one without a name.
 
 A sheet that cannot be streamed records `scan_error` and the remaining sheets are
 still reported. Chartsheets and dialog sheets are listed, but carry no rows and
@@ -292,6 +346,11 @@ xlpeek read book.xlsx -s 明细 --header --columns "订单号,金额"
 xlpeek read book.xlsx -s 明细 --header --where "金额>10000" -l 50
 xlpeek read book.xlsx -s 明细 --header --fill-merged            # merge-aware
 xlpeek read book.xlsx -s 明细 --header --format tsv -l 500      # cheaper than JSON
+xlpeek read book.xlsx -s 明细 --header --columns "A:D" -l 100   # a range, not a list
+xlpeek read book.xlsx -s 明细 --header --dates iso -l 100       # stable dates
+xlpeek read book.xlsx -s 0 -l 1                                 # sheet by index
+xlpeek read book.xlsx -s 明细 --header --format csv -l 100
+xlpeek read book.xlsx -s 明细 --header --format markdown -l 100
 ```
 
 The response carries everything needed to fetch the next page:
@@ -315,15 +374,36 @@ The response carries everything needed to fetch the next page:
   caller can map a page back to cell references.
 - **Sparse sheets produce blank rows.** Reading is positional: a position exists
   for every row number up to the last one the sheet defines, so a sheet whose
-  data starts at row 19 returns 18 blank rows first, and a single stray
-  formatted row at the bottom pads every page out to a million rows. Pass
-  `--skip-empty` to drop rows whose cells are all empty. Row numbers stay
-  absolute either way, so `first_row` still tells you where you are.
+  data starts at row 19 returns 18 blank rows first. Pass `--skip-empty` to drop
+  rows whose cells are all empty. Row numbers stay absolute either way, so
+  `first_row` still tells you where you are.
+- **`complete` answers about content, not position.** A sheet's last row is its
+  last *formatted* row, so a border or a fill dragged past the data leaves the
+  file claiming rows that hold nothing. Those are not data and no longer count
+  as more to fetch: the page on which the sheet's content ends reports
+  `complete: true` rather than sending the caller through blank pages. A gap in
+  the middle of a sheet is unaffected — the lookahead still scans across it.
 - Columns are projected in the order requested and padded to a uniform width so
   a row never silently changes shape. `columns` tells you the width per page.
 - In `--header` mode each row is an object whose key order follows the worksheet
   column order. Blank header cells fall back to the column letter, and duplicate
   headers get a `_2`, `_3` suffix rather than collapsing two columns into one.
+
+`--dates` decides how a *date* cell is written, because a date is a number
+wearing a number format and the same value otherwise reads as
+`2026-01-01 0:00:00` in one workbook and `01-01-26` in the next:
+
+```bash
+xlpeek read book.xlsx -s 明细 --header --dates iso -l 100   # 2026-01-01
+xlpeek read book.xlsx -s 明细 --header --dates serial -l 100
+```
+
+`iso` gives `2026-01-01`, or `2026-01-01T09:30:00` when a time of day is
+stored; `serial` gives the stored number. The default, `display`, is what the
+sheet itself shows. This one is not free: telling a date from a number means
+reading the cell's number format, which parses the worksheet — so, like `--calc`
+and `--fill-merged`, it is opt-in. A cell that merely *contains* a date as text
+is left alone.
 
 ### `agg` — ask an analytical question, get a small answer
 
@@ -363,10 +443,23 @@ read as arithmetic; getting it wrong says so and repeats the form.
 `--derive "name=expression"` computes a metric from the aggregate fields already
 computed, which is what ratios need: `sum(收入-成本)/sum(收入)` is the overall
 margin, whereas averaging per-row margins is not. Referencing a field that was
-never computed is a usage error rather than a null.
+never computed is a usage error rather than a null, and the message names the
+field you probably meant.
 
-Field naming is predictable: `sum_收入金额`, `avg_收入金额`, `distinct_客户编号`,
-`count`, plus whatever `--derive` names.
+The name a bracketed column produces is the bracketed name, so a derived metric
+refers to it exactly as `agg` reports it:
+
+```bash
+xlpeek agg book.xlsx -s 明细 --header --sum "[金额(万元)]" --sum "[成本(万元)]" \
+    --derive "毛利率=(sum_[金额(万元)]-sum_[成本(万元)])/sum_[金额(万元)]"
+```
+
+Field naming is predictable in two halves: leave the name out and the aggregate
+kind is prefixed (`sum_收入金额`, `avg_收入金额`, `distinct_客户编号`, `count`);
+name it yourself with `name=expression` and the field is called *exactly* that,
+with no prefix, because that is what naming it is for. So
+`--sum "收入=[金额(万元)]"` produces `收入`, and a later `--derive` that refers
+to `sum_收入` is a usage error — one the message will tell you how to fix.
 
 - **Missing values are skipped, not zeroed.** A blank cell does not drag an
   average down; inside an expression it counts as zero, the way a spreadsheet
@@ -378,7 +471,10 @@ Field naming is predictable: `sum_收入金额`, `avg_收入金额`, `distinct_�
   are reported to 15 significant digits, matching Excel's own precision.
 - `--sort-by` sorts aggregates descending and group keys ascending; `--limit` and
   `--offset` page the resulting groups with the same `has_more`/`next_offset`
-  contract as `read`.
+  contract as `read`. **`--limit` defaults to 1000**, and `--limit 0` asks for
+  every group: grouping by a near-unique column is an easy mistake to make and
+  an expensive one to receive, so the default truncates and says so rather than
+  sending the table back. The warning names the flag and the cursor.
 - Cells that cannot be read as numbers are skipped and counted in `warnings`.
 - A value is read the way the sheet presents it, so a `¥1,234.50` or `12.35%`
   column aggregates without `--raw`, and the sum agrees with the one `--raw`
@@ -448,8 +544,23 @@ xlpeek find book.xlsx -s 明细 -v "已取消" --header --column 状态 -l 20
 Returns each hit with its cell reference, row and column, the matched value, and
 the surrounding row for context. `row_values` is padded to the same width the
 `read` command would report, so column positions agree between the two.
-`truncated: true` means the search stopped at `--limit` (or `--max-scan`) and
-more matches may exist — it does not assert that they do.
+
+`--offset` pages the matches the way `read` pages rows, counting matches rather
+than rows, and `next_offset` is where to continue:
+
+```bash
+xlpeek find book.xlsx -s 明细 -v "已取消" --header -l 20 -o 20
+```
+
+`truncated: true` means there is at least one more match; the search settles
+that by looking one match ahead rather than assuming, so the last page reports
+`truncated: false` and `complete: true`. `truncated_approximate: true` marks the
+case where it gave up looking rather than answered — the next match is more than
+10,000 rows further on — and there it is a "may exist" rather than an assertion.
+
+`find` takes `--dates` too, and rewrites the cells *before* searching them, so a
+pattern written the way the response will read back — `2026-01-01` — is the
+pattern that finds it.
 
 ### `serve` — hold the workbook open across requests
 
@@ -514,9 +625,21 @@ Repeatable, combined with AND, and applied before aggregating.
 | `>` `>=` `<` `<=` | comparison |
 | `~` | case-insensitive substring |
 
-The column may be a header name (in `--header` mode), a column letter (`B`), or a
-1-based index (`2`). A header name wins over a letter, so a column literally
-named `A` is still addressable by name.
+The column may be a header name (in `--header` mode), a column letter (`B`), a
+1-based index (`2`), or in `-s` the sheet likewise. A header name wins over a
+letter, so a column literally named `A` is still addressable by name.
+
+Everything after the first operator is the value, and a filter is exactly one
+column, one operator and one value. An expression that does not parse is a usage
+error rather than an interpretation, because the interpretations were worse than
+the error: `金额>>100` read as the value `>100` and matched nothing,
+`金额>100>200` matched one row, and `金额>` read as the empty value, which every
+cell compares greater than, so it matched the whole sheet — all three reporting
+success. A value that genuinely contains one of `> < = ~` is written in quotes:
+
+```bash
+xlpeek read book.xlsx -s 明细 --header --where "备注~'a>b'" -l 20
+```
 
 Comparison is numeric as soon as the filter value reads as a number; a cell that
 does not read as one then fails to match rather than falling back to text
@@ -525,6 +648,25 @@ value: thousands separators, one currency symbol on either side, and a trailing
 `%`, which divides — `--where "比率>20%"` compares against 0.2, so a cell showing
 `5.00%` does not match it, and tightening the threshold to `2%` can only ever
 shrink the result.
+
+When the filter value is *not* a number but the cells are, the comparison is
+text — that is what a date range needs — and the response says so:
+
+```
+"warnings": ["filter \"金额>1OO\": the value \"1OO\" is not a number, but 3
+cell(s) in column \"金额\" read as one (first: \"100\"), so they were compared
+as text — ordered by their digits, not by their value; check the value for a
+typo, or use ~ to search the text deliberately"]
+```
+
+That is the shape a mistyped numeric literal takes, and the rows it matches have
+nothing to do with the rows the caller meant. `warning_count > 0` means the
+filter answered a different question than it looks like it asked.
+
+Equality is compared at the 15 significant digits the tool reports in, so
+`--raw --where "比率=25.67%"` matches a cell holding `0.2567` — writing the value
+as a percentage divides it by 100, and that quotient is one ulp away from the
+double the cell stores. The range comparisons are unaffected.
 
 A currency symbol is presentation only: it is stripped, never converted, so the
 default path and `--raw` answer the same question, and a column mixing symbols
@@ -571,8 +713,10 @@ they are there.
 
 ## Output formats
 
-`read --format tsv` writes the JSON envelope, then a header line, then
-tab-separated rows:
+`read --format tsv|csv|markdown` writes the JSON envelope, then a header line,
+then the rows — tab-separated, comma-separated, or a markdown table. `tsv` is
+the cheapest to feed to a model, `csv` is for anything that already reads CSV,
+and `markdown` is for pasting into a report.
 
 ```
 {"ok":true,...,"format":"tsv","rows":null}
@@ -622,7 +766,8 @@ with embedded line breaks would otherwise corrupt the table.
   restrictive `--where`), it reports `has_more: true` together with
   `has_more_approximate: true`. The bias is deliberate: a false `false` would
   make a caller stop early and silently miss data, while a false `true` only
-  costs one extra request.
+  costs one extra request. Rows that are formatted but empty do not count as
+  more data, so a sheet with a long formatted tail ends instead of paging.
 - `--max-columns` (default 128) caps the width of a page. Truncation is reported
   via `columns_capped` on `info` and a warning on `read`.
 - Reading formatted values means dates arrive as formatted strings and numbers as

@@ -33,9 +33,19 @@ def run(*args):
     p = subprocess.run([EXE, *args], capture_output=True, timeout=120)
     out = p.stdout.decode('utf-8', 'replace').strip()
     try:
-        return json.loads(out.splitlines()[0])
+        env = json.loads(out.splitlines()[0])
     except Exception:
-        return {'_raw': out[:200]}
+        env = {'_raw': out[:200]}
+    if not env.get('ok'):
+        # A failed call leaves the assertions to record FAIL rather than raise.
+        # Indexing env['data'] directly used to turn the first unexpected
+        # failure into a traceback, which stops at the first problem instead of
+        # reporting all of them — and reads as a broken suite rather than a
+        # broken command.
+        print('  (command failed: %s)' % (env.get('error') or env.get('_raw')))
+        env.setdefault('data', {'warning_count': 0, 'warnings': [], 'rows': [],
+                                'columns': [], 'matches': [], 'sheets': []})
+    return env
 
 
 def check(name, got, want):

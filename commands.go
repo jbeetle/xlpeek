@@ -75,9 +75,15 @@ type sheetInfo struct {
 	Scanned       bool       `json:"scanned,omitempty"`
 	LastRow       int        `json:"last_row,omitempty"`
 	PopulatedRows int        `json:"populated_rows,omitempty"`
-	MergedRanges  int        `json:"merged_ranges,omitempty"`
-	MergedSample  []string   `json:"merged_sample,omitempty"`
-	ScanError     string     `json:"scan_error,omitempty"`
+	// LastPopulatedRow is the row number of the last row holding anything, and
+	// it is the one number that answers "where does the data end". max_row is
+	// the file's own hint and counts formatted empty rows, last_row is where
+	// the scan stopped, and populated_rows is a count rather than a position —
+	// so a caller wanting to plan paging had nothing to compute it from.
+	LastPopulatedRow int      `json:"last_populated_row,omitempty"`
+	MergedRanges     int      `json:"merged_ranges,omitempty"`
+	MergedSample     []string `json:"merged_sample,omitempty"`
+	ScanError        string   `json:"scan_error,omitempty"`
 }
 
 // cmdInfo summarises a workbook so a caller can decide which sheet to read and
@@ -101,7 +107,7 @@ func cmdInfo(args []string) int {
 		return code
 	}
 	if len(operands) != 1 {
-		return failUsage("info", "expected exactly one workbook path")
+		return operandError("info", operands, "exactly one workbook path")
 	}
 	if *sample < 0 {
 		return failUsage("info", "--sample must not be negative")
@@ -207,6 +213,7 @@ func describeSheet(f *excelize.File, name string, index, id, headerRow, sampleRo
 		info.Scanned = true
 		info.LastRow = scan.lastRow
 		info.PopulatedRows = scan.populatedRows
+		info.LastPopulatedRow = scan.lastPopulatedRow
 		// Merged regions are a correctness hazard for a reader that does not
 		// know about them, so a deep scan surfaces them. It is kept out of the
 		// shallow path because reading them parses the whole worksheet.
@@ -250,6 +257,7 @@ type readResult struct {
 	HeaderRow    int      `json:"header_row,omitempty"`
 	SkipEmpty    bool     `json:"skip_empty,omitempty"`
 	FillMerged   bool     `json:"fill_merged,omitempty"`
+	Dates        string   `json:"dates,omitempty"`
 	Header       []string `json:"header,omitempty"`
 	Columns      []string `json:"columns"`
 	Format       string   `json:"format,omitempty"`
@@ -286,7 +294,8 @@ func cmdRead(args []string) int {
 	skipEmpty := fs.Bool("skip-empty", false, "drop rows whose cells are all empty; sparse sheets otherwise pad every page with blanks")
 	calc := fs.Bool("calc", false, "evaluate formulas that have no cached value; loads the sheet into memory")
 	fillMerged := fs.Bool("fill-merged", false, "copy each merged region's value into every cell it spans; loads the sheet into memory")
-	format := fs.String("format", "json", "output format: json, or tsv for a header line plus tab-separated rows after the envelope")
+	format := fs.String("format", "json", "table output after the envelope: json, or tsv, csv or markdown for a header line plus delimited rows")
+	dates := fs.String("dates", datesDisplay, dateModeHelp)
 	maxColumns := fs.Int("max-columns", defaultMaxColumns, "cap on the number of columns returned")
 	password := fs.String("password", "", "password for an encrypted workbook")
 	raw := fs.Bool("raw", false, "return stored values instead of number-formatted values")
@@ -300,7 +309,7 @@ func cmdRead(args []string) int {
 		return code
 	}
 	if len(operands) != 1 {
-		return failUsage("read", "expected exactly one workbook path")
+		return operandError("read", operands, "exactly one workbook path")
 	}
 	if *offset < 0 {
 		return failUsage("read", "--offset must not be negative")
@@ -314,8 +323,16 @@ func cmdRead(args []string) int {
 	if *headerRow < 0 {
 		return failUsage("read", "--header-row must not be negative")
 	}
-	if *format != "json" && *format != "tsv" {
-		return failUsage("read", fmt.Sprintf("--format must be json or tsv, got %q", *format))
+	switch *format {
+	case "json", "tsv", "csv", "markdown":
+	default:
+		return failUsage("read", fmt.Sprintf(
+			"--format must be json, tsv, csv or markdown, got %q", *format))
+	}
+	if !validDateMode(*dates) {
+		return failUsage("read", fmt.Sprintf(
+			"--dates must be %s, %s or %s, got %q",
+			datesDisplay, datesISO, datesSerial, *dates))
 	}
 	// --header is shorthand for --header-row 1; an explicit row wins, which is
 	// what a caller wants for a sheet whose table starts below a title block.
@@ -353,6 +370,7 @@ func cmdRead(args []string) int {
 		skipEmpty:  *skipEmpty,
 		calc:       *calc,
 		fillMerged: *fillMerged,
+		dates:      *dates,
 		maxColumns: *maxColumns,
 	})
 	if err != nil {
@@ -361,7 +379,9 @@ func cmdRead(args []string) int {
 
 	projection, err := buildProjection(columns, res.header, res.width)
 	if err != nil {
-		return respondErr("read", codeColumnNotFound, err.Error(), *pretty, exitError)
+		// A column that is not there is the command's fault, not the file's:
+		// fixing the name is what fixes it, and the status says so.
+		return respondErr("read", codeColumnNotFound, err.Error(), *pretty, exitUsage)
 	}
 
 	keys := headerKeys(res.header, res.width)
@@ -402,23 +422,40 @@ func cmdRead(args []string) int {
 		Format:        *format,
 		Rows:          buildRows(projected, outNames, headerAt > 0),
 	}
+	if *dates != datesDisplay {
+		result.Dates = *dates
+	}
 	if res.hasMore {
 		next := *offset + len(res.rows)
 		result.NextOffset = &next
 	}
 	result.Complete = !res.hasMore
 	result.WarningCount = len(res.warnings)
-	if *format == "tsv" {
+	if *format != "json" {
 		// The rows move to the body, so the envelope carries only the metadata.
 		// A caller still reads line 1 as JSON and follows next_offset from it.
 		result.Rows = nil
-		return respondTSV("read", result, buildTSV(outNames, projected), *pretty)
+		var body string
+		switch *format {
+		case "tsv":
+			body = buildTSV(outNames, projected)
+		case "csv":
+			body = buildCSV(outNames, projected)
+		case "markdown":
+			body = buildMarkdown(outNames, projected)
+		}
+		return respondWithBody("read", result, body, *pretty)
 	}
 	return respondOK("read", result, *pretty)
 }
 
 // buildProjection resolves the --columns value into 0-based column indexes.
 // With no projection every column of the page is returned.
+//
+// A request may name a range — "A:D", or "订单号:金额" by header — because the
+// alternative is writing out a run of letters that a caller has to count, which
+// is how the wrong columns get projected. Either end may be written any of the
+// ways a single column can.
 func buildProjection(columns string, header []string, width int) ([]int, error) {
 	requested := splitList(columns)
 	if len(requested) == 0 {
@@ -430,11 +467,31 @@ func buildProjection(columns string, header []string, width int) ([]int, error) 
 	}
 	projection := make([]int, 0, len(requested))
 	for _, name := range requested {
-		idx, err := resolveColumn(name, header)
+		from, to, isRange := strings.Cut(name, ":")
+		if !isRange {
+			idx, err := resolveColumn(name, header)
+			if err != nil {
+				return nil, err
+			}
+			projection = append(projection, idx)
+			continue
+		}
+		start, err := resolveColumn(from, header)
 		if err != nil {
 			return nil, err
 		}
-		projection = append(projection, idx)
+		end, err := resolveColumn(to, header)
+		if err != nil {
+			return nil, err
+		}
+		if end < start {
+			return nil, fmt.Errorf(
+				"column range %q runs backwards: %s is column %s and %s is column %s",
+				name, from, columnLetter(start+1), to, columnLetter(end+1))
+		}
+		for idx := start; idx <= end; idx++ {
+			projection = append(projection, idx)
+		}
 	}
 	return projection, nil
 }
@@ -485,13 +542,25 @@ type findResult struct {
 	UseRegex   bool     `json:"regex"`
 	IgnoreCase bool     `json:"ignore_case"`
 	Header     []string `json:"header,omitempty"`
+	Dates      string   `json:"dates,omitempty"`
 	MatchCount int      `json:"match_count"`
 	Truncated  bool     `json:"truncated"`
+	// TruncatedApprox qualifies a truncated result the lookahead could not
+	// settle: the scan gave up looking for the next match, so there may or may
+	// not be one. Without it, "truncated" would have to mean both.
+	TruncatedApprox bool `json:"truncated_approximate,omitempty"`
 	// Complete is the plain-language counterpart of Truncated: these are all
 	// the matches there are.
-	Complete    bool        `json:"complete"`
-	RowsScanned int         `json:"rows_scanned"`
-	Matches     []findMatch `json:"matches"`
+	Complete    bool `json:"complete"`
+	RowsScanned int  `json:"rows_scanned"`
+	// Offset and NextOffset page the matches the way read pages rows, so that
+	// a search over a workbook with hundreds of hits is continued rather than
+	// pulled across the wire in one call. Without them the only way to see the
+	// sixth match was to raise --limit until every match and its context row
+	// arrived at once.
+	Offset     int         `json:"offset,omitempty"`
+	NextOffset *int        `json:"next_offset,omitempty"`
+	Matches    []findMatch `json:"matches"`
 }
 
 type findMatch struct {
@@ -519,7 +588,10 @@ func cmdFind(args []string) int {
 	headerRowFlag := fs.Int("header-row", 0, "worksheet row holding the column names; overrides --header")
 	limit := fs.Int("limit", 50, "maximum matches to return")
 	fs.IntVar(limit, "l", 50, "maximum matches to return (shorthand)")
+	offset := fs.Int("offset", 0, "matches to skip; counts matches, so it always walks forward from the start")
+	fs.IntVar(offset, "o", 0, "matches to skip (shorthand)")
 	maxScan := fs.Int("max-scan", 0, "give up after this many rows; 0 means no limit")
+	dates := fs.String("dates", datesDisplay, dateModeHelp)
 	maxColumns := fs.Int("max-columns", defaultMaxColumns, "cap on the number of columns in row context")
 	password := fs.String("password", "", "password for an encrypted workbook")
 	raw := fs.Bool("raw", false, "search stored values instead of number-formatted values")
@@ -531,7 +603,7 @@ func cmdFind(args []string) int {
 		return code
 	}
 	if len(operands) != 1 {
-		return failUsage("find", "expected exactly one workbook path")
+		return operandError("find", operands, "exactly one workbook path")
 	}
 	if needle == "" {
 		return failUsage("find", "--value must not be empty")
@@ -541,6 +613,14 @@ func cmdFind(args []string) int {
 	}
 	if *maxScan < 0 {
 		return failUsage("find", "--max-scan must not be negative")
+	}
+	if *offset < 0 {
+		return failUsage("find", "--offset must not be negative")
+	}
+	if !validDateMode(*dates) {
+		return failUsage("find", fmt.Sprintf(
+			"--dates must be %s, %s or %s, got %q",
+			datesDisplay, datesISO, datesSerial, *dates))
 	}
 
 	var re *regexp.Regexp
@@ -592,7 +672,11 @@ func cmdFind(args []string) int {
 		Pattern:    needle,
 		UseRegex:   *useRegex,
 		IgnoreCase: *ignoreCase,
+		Offset:     *offset,
 		Matches:    make([]findMatch, 0, *limit),
+	}
+	if *dates != datesDisplay {
+		result.Dates = *dates
 	}
 	headerAt := 0
 	if *headerMode {
@@ -608,17 +692,56 @@ func cmdFind(args []string) int {
 	columnIndex := -1
 	if column != "" && headerAt == 0 {
 		if columnIndex, err = resolveColumn(column, nil); err != nil {
-			return respondErr("find", codeColumnNotFound, err.Error(), *pretty, exitError)
+			return respondErr("find", codeColumnNotFound, err.Error(), *pretty, exitUsage)
 		}
 	}
 
 	var (
-		pos  int
-		keys []string
+		pos     int
+		keys    []string
+		skipped int
+		// probing is set once the page is full. The scan then continues, not to
+		// collect matches but to find out whether another one exists: stopping
+		// at the limit reported truncated either way, so the last page of a
+		// search said "there may be more" and cost the caller one more call to
+		// find out there was not. The scan is bounded like read's lookahead, so
+		// a search whose remaining matches are far away still answers, just
+		// approximately.
+		probing  bool
+		probe    int
+		resolver *dateResolver
+		held     *excelize.Rows
 	)
+	// markMore records that the response is short of the answer, with a cursor
+	// to the match it stopped before.
+	markMore := func(approximate bool) {
+		result.Truncated = true
+		result.TruncatedApprox = approximate
+		next := *offset + len(result.Matches)
+		result.NextOffset = &next
+	}
+	if *dates != datesDisplay {
+		resolver = newDateResolver(f, *dates)
+		if held, err = f.Rows(sheetName); err != nil {
+			return failWithSheet("find", err, f.GetSheetList(), *pretty)
+		}
+		defer func() { _ = held.Close() }()
+	}
 scan:
 	for iter.Next() {
 		pos++
+		var stored []string
+		if held != nil {
+			if held.Next() {
+				// The stored number is asked for per call rather than inherited
+				// from how the workbook was opened: the row above needs the
+				// displayed value whatever --raw says, and this one needs the
+				// number behind it either way.
+				if stored, err = held.Columns(excelize.Options{RawCellValue: true}); err != nil {
+					return failWithSheet("find", err, f.GetSheetList(), *pretty)
+				}
+			}
+		}
 		if pos < firstDataRow {
 			if headerAt > 0 && pos == headerAt {
 				if result.Header, err = iter.Columns(); err != nil {
@@ -626,7 +749,7 @@ scan:
 				}
 				if column != "" {
 					if columnIndex, err = resolveColumn(column, result.Header); err != nil {
-						return respondErr("find", codeColumnNotFound, err.Error(), *pretty, exitError)
+						return respondErr("find", codeColumnNotFound, err.Error(), *pretty, exitUsage)
 					}
 				}
 			}
@@ -636,11 +759,22 @@ scan:
 		if err != nil {
 			return failWithSheet("find", err, f.GetSheetList(), *pretty)
 		}
+		if resolver != nil {
+			// Rewritten before the search, so that a pattern written the way
+			// the response will read back — "2026-01-01" — is the pattern that
+			// finds it.
+			cells = resolver.apply(sheetName, pos, cells, stored)
+		}
 		// Stop before searching a row that would exceed the budget, so the
 		// reported rows_scanned equals --max-scan exactly rather than
-		// overshooting by one.
+		// overshooting by one. During the probe the window closing is not an
+		// answer either way, so it is reported as an approximate one.
 		if *maxScan > 0 && result.RowsScanned >= *maxScan {
-			result.Truncated = true
+			if probing {
+				markMore(true)
+			} else {
+				result.Truncated = true
+			}
 			break
 		}
 		result.RowsScanned++
@@ -669,6 +803,19 @@ scan:
 			if i >= len(cells) || !matches(cells[i]) {
 				continue
 			}
+			// --offset counts matches, not rows, so a skipped match is one the
+			// search would otherwise have returned: the scan still walks the
+			// sheet from the top, exactly as read does.
+			if skipped < *offset {
+				skipped++
+				continue
+			}
+			if probing {
+				// One more match exists, so the page that was just filled is
+				// not the last one.
+				markMore(false)
+				break scan
+			}
 			ref, coordErr := excelize.CoordinatesToCellName(i+1, pos)
 			if coordErr != nil {
 				continue
@@ -686,7 +833,19 @@ scan:
 			}
 			result.Matches = append(result.Matches, match)
 			if len(result.Matches) >= *limit {
-				result.Truncated = true
+				// The page is full. The scan continues in probe mode: whether
+				// there is another match is a question about the sheet, and it
+				// can be answered now more cheaply than by a caller who has to
+				// come back and ask again.
+				probing = true
+			}
+		}
+		if probing {
+			probe++
+			if probe > lookaheadCap {
+				// The remaining matches are further away than the lookahead
+				// reaches. Saying "there may be more" is the safe direction.
+				markMore(true)
 				break scan
 			}
 		}

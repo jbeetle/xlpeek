@@ -544,21 +544,32 @@ func TestEnvelopeReportsDataBytes(t *testing.T) {
 // Grouping by a near-unique column returns the table with extra steps; the
 // warning exists to say so before the cost lands in a caller's context.
 func TestGroupWarning(t *testing.T) {
-	if got := groupWarning(11, 0); got != "" {
+	if got := groupWarning(11, 0, false); got != "" {
 		t.Errorf("a small grouping needs no warning, got %q", got)
 	}
-	if got := groupWarning(aggGroupWarnThreshold, 0); got != "" {
+	if got := groupWarning(aggGroupWarnThreshold, 0, false); got != "" {
 		t.Errorf("at the threshold there is still nothing to say, got %q", got)
 	}
-	got := groupWarning(aggGroupWarnThreshold+1, 0)
+	got := groupWarning(aggGroupWarnThreshold+1, 0, true)
 	if got == "" {
 		t.Fatal("an unbounded large grouping should warn")
 	}
 	if !strings.Contains(got, "--limit") {
 		t.Errorf("the warning should name the way out, got %q", got)
 	}
-	if got := groupWarning(50000, 100); got != "" {
+	if got := groupWarning(50000, 100, true); got != "" {
 		t.Errorf("a caller who set --limit has already handled it, got %q", got)
+	}
+	// A cap the caller did not ask for is a truncation, and the caller has to
+	// be told which it is holding: the default cut the list, not their choice.
+	capped := groupWarning(aggGroupWarnThreshold+1, aggDefaultGroupLimit, false)
+	if capped == "" {
+		t.Fatal("a grouping cut off by the default limit should say so")
+	}
+	for _, want := range []string{"--limit", "next_offset", "1000"} {
+		if !strings.Contains(capped, want) {
+			t.Errorf("the warning should mention %q, got %q", want, capped)
+		}
 	}
 }
 
@@ -1027,5 +1038,254 @@ func TestOrderedRowEmitsNumbers(t *testing.T) {
 	}
 	if got, want := marshalLikeCLI(t, row), `{"region":"华北","total":2839456194.25}`; got != want {
 		t.Errorf("Marshal(orderedRow) = %s, want %s", got, want)
+	}
+}
+
+// The first operator decides where the column ends, and operators are matched
+// whole: "!=" is one operator, and the "!" of a value like "hello!" is not an
+// operator at all. Matching by leading character got "status!=done" wrong.
+func TestOperatorAt(t *testing.T) {
+	cases := []struct {
+		in string
+		at int
+		op string
+	}{
+		{in: "status!=done", at: 6, op: "!="},
+		{in: "金额>1000", at: 6, op: ">"},
+		{in: "金额 >= 100", at: 7, op: ">="},
+		// ">>=" is ">" followed by ">=": the second one is a second operator,
+		// which is what makes it a syntax error rather than a comparison.
+		{in: "金额 >>= 100", at: 7, op: ">"},
+		{in: "备注=hello!", at: 6, op: "="},
+		{in: "状态~完成", at: 6, op: "~"},
+		{in: "金额", at: -1, op: ""},
+		{in: "", at: -1, op: ""},
+	}
+	for _, tc := range cases {
+		at, op := operatorAt(tc.in)
+		if at != tc.at || op != tc.op {
+			t.Errorf("operatorAt(%q) = (%d, %q), want (%d, %q)", tc.in, at, op, tc.at, tc.op)
+		}
+	}
+}
+
+// Every expression here was accepted before 1.0.3 and returned ok:true with a
+// row count that looked like an answer — "金额>" matched the whole sheet,
+// because every cell compares greater than the empty string.
+func TestParseFilterRejectsMalformedExpressions(t *testing.T) {
+	for _, expr := range []string{
+		"金额>>100", "金额>", "金额>100>200", "金额>=>100", "金额>>=100", "金额==>100", "金额",
+	} {
+		if _, err := parseFilter(expr); err == nil {
+			t.Errorf("parseFilter(%q) was accepted; a malformed filter must be rejected", expr)
+		}
+	}
+}
+
+// Strict does not mean inexpressible: quoting is how a value that really holds
+// an operator is written, and an empty quoted value still selects blank cells.
+func TestParseFilterQuotingEscapesTheGrammar(t *testing.T) {
+	cases := []struct {
+		in    string
+		value string
+	}{
+		{in: "备注~'a>b'", value: "a>b"},
+		{in: `备注~"a=b"`, value: "a=b"},
+		{in: "状态='完成'", value: "完成"},
+		{in: "备注=''", value: ""},
+	}
+	for _, tc := range cases {
+		flt, err := parseFilter(tc.in)
+		if err != nil {
+			t.Errorf("parseFilter(%q): %v", tc.in, err)
+			continue
+		}
+		if flt.value != tc.value {
+			t.Errorf("parseFilter(%q).value = %q, want %q", tc.in, flt.value, tc.value)
+		}
+	}
+}
+
+// A filter value written as a percentage is scaled by 0.01 when it is parsed,
+// and that product is one ulp away from the decimal a cell stores. Equality has
+// to absorb that, or "比率=25.67%" finds nothing while "比率>25.66%" finds the row.
+func TestFilterEqualityIgnoresOneUlp(t *testing.T) {
+	flt, err := parseFilter("比率=25.67%")
+	if err != nil {
+		t.Fatalf("parseFilter: %v", err)
+	}
+	if !flt.match("25.67%") {
+		t.Error("比率=25.67% did not match a cell showing 25.67%")
+	}
+	if !flt.match("0.2567") {
+		t.Error("比率=25.67% did not match the stored value 0.2567 (the --raw path)")
+	}
+	if flt.match("0.2568") {
+		t.Error("比率=25.67% matched 0.2568; the 15-digit comparison is too wide")
+	}
+}
+
+// The comparison that answers in text what was asked in numbers is the shape a
+// mistyped numeric literal takes, and the rows it matches are unrelated to the
+// question. It has to be visible; comparing text with text is normal and is not.
+func TestFilterReportsTextFallbackAgainstNumbers(t *testing.T) {
+	numeric, err := parseFilter("金额>1OO")
+	if err != nil {
+		t.Fatalf("parseFilter: %v", err)
+	}
+	for _, cell := range []string{"100", "1000", "2000"} {
+		numeric.match(cell)
+	}
+	warnings := filterWarnings([]*filter{numeric})
+	if len(warnings) != 1 {
+		t.Fatalf("got %d warnings, want 1: %v", len(warnings), warnings)
+	}
+	for _, want := range []string{"1OO", "金额", "3 cell"} {
+		if !strings.Contains(warnings[0], want) {
+			t.Errorf("warning %q does not mention %q", warnings[0], want)
+		}
+	}
+
+	text, _ := parseFilter("状态=完成")
+	text.match("完成")
+	if got := filterWarnings([]*filter{text}); len(got) != 0 {
+		t.Errorf("a text filter against a text column warned: %v", got)
+	}
+
+	// A date range is the reason text comparison exists.
+	dates, _ := parseFilter("日期>2024-08-21")
+	dates.match("2024-09-01")
+	if got := filterWarnings([]*filter{dates}); len(got) != 0 {
+		t.Errorf("a date range warned: %v", got)
+	}
+}
+
+// A bracket inside an operand belongs to the name, so the field this tool
+// reports for --sum "[金额(万元)]" can be referenced by --derive. The brackets
+// also nest, because an expression may be bracketed as a whole.
+func TestBracketScanningHandlesNesting(t *testing.T) {
+	// Byte offsets: each CJK character is three of them, so the "]" that closes
+	// the bracket at index 4 sits at 19.
+	if got, want := closingBracket("sum_[金额(万元)]-1", 4), 19; got != want {
+		t.Errorf("closingBracket = %d, want %d", got, want)
+	}
+	if got := closingBracket("sum_[金额", 4); got != -1 {
+		t.Errorf("an unclosed bracket should report -1, got %d", got)
+	}
+	if _, err := parseExpr("sum_[金额(万元)]-sum_[成本(万元)]"); err != nil {
+		t.Errorf("an aggregate field with a bracketed column should parse: %v", err)
+	}
+	if _, err := parseExpr("[sum_[金额(万元)]]*2"); err != nil {
+		t.Errorf("a doubly bracketed field should parse: %v", err)
+	}
+
+	// The bracket hint is for a bare name, not for a broken expression: telling
+	// a caller who wrote arithmetic to wrap it in brackets answers a question
+	// they did not ask, and the advice does not work when they take it.
+	if !bareName("金额(万元)") {
+		t.Error("a bracketed column name should count as a bare name")
+	}
+	if bareName("(收入-成本)/收入") {
+		t.Error("an expression should not count as a bare name")
+	}
+	if got := bracketHint("(sum_[金额(万元)]-sum_[成本(万元)])/sum_[金额(万元)]"); got != "" {
+		t.Errorf("the hint was offered for an expression: %q", got)
+	}
+	if got := bracketHint("金额(万元)"); !strings.Contains(got, "[金额(万元)]") {
+		t.Errorf("the hint was not offered for a bracketed name: %q", got)
+	}
+}
+
+// Which cells hold dates is decided by their number format, and the letters
+// that mean a field also occur in the words a format can print.
+func TestHasDateField(t *testing.T) {
+	cases := []struct {
+		code string
+		want bool
+	}{
+		{code: "yyyy-mm-dd", want: true},
+		{code: "mm-dd-yy", want: true},
+		{code: "yyyy\"年\"m\"月\"", want: true},
+		{code: "[$-409]d-mmm-yy", want: true},
+		{code: "[h]:mm:ss", want: true}, // elapsed time is a field too
+		{code: "#,##0.00", want: false},
+		{code: "0.00%", want: false},
+		{code: "¥#,##0.00", want: false},
+		{code: `#,##0.00 "per day"`, want: false},
+		{code: "[Red]#,##0", want: false},
+		{code: "General", want: false},
+		{code: "0.0_);(0.0)", want: false},
+	}
+	for _, tc := range cases {
+		if got := hasDateField(tc.code); got != tc.want {
+			t.Errorf("hasDateField(%q) = %v, want %v", tc.code, got, tc.want)
+		}
+	}
+
+	// The built-in formats are fixed by the file format: 14-22 are dates and
+	// times, 45-47 elapsed time, and everything else is a number or text.
+	custom := "yyyy-mm-dd"
+	builtin := []struct {
+		id   int
+		want bool
+	}{
+		{id: 14, want: true}, {id: 22, want: true}, {id: 45, want: true},
+		{id: 0, want: false}, {id: 9, want: false}, {id: 49, want: false},
+	}
+	for _, tc := range builtin {
+		if got := isDateFormat(&excelize.Style{NumFmt: tc.id}); got != tc.want {
+			t.Errorf("isDateFormat(NumFmt %d) = %v, want %v", tc.id, got, tc.want)
+		}
+	}
+	if !isDateFormat(&excelize.Style{NumFmt: 0, CustomNumFmt: &custom}) {
+		t.Error("a custom date format should win over the built-in id")
+	}
+}
+
+// "--ignore-case true" is what most people write first, and the "true" landing
+// in the operand list produced an error about a workbook path. Only the two
+// words are accepted: "1" and "0" would swallow an operand meant literally.
+func TestIsBoolWord(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{in: "true", want: true},
+		{in: "TRUE", want: true},
+		{in: "False", want: true},
+		{in: "false", want: true},
+		{in: "1", want: false},
+		{in: "0", want: false},
+		{in: "yes", want: false},
+		{in: "book.xlsx", want: false},
+	}
+	for _, tc := range cases {
+		if got := isBoolWord(tc.in); got != tc.want {
+			t.Errorf("isBoolWord(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// A remark column holding a comma, a quote or a line break is exactly what a
+// finance export contains, and the reader splitting on commas is the thing most
+// likely to consume this.
+func TestBuildCSVQuotesTheWayRFC4180Does(t *testing.T) {
+	body := buildCSV([]string{"名称", "备注"}, [][]string{
+		{"甲,乙", "行1\n行2"},
+		{`说"明`, "x"},
+	})
+	want := "名称,备注\n\"甲,乙\",\"行1\n行2\"\n\"说\"\"明\",x\n"
+	if body != want {
+		t.Errorf("buildCSV =\n%q\nwant\n%q", body, want)
+	}
+}
+
+// A pipe would end the cell early and shift every column after it; a line break
+// would end the row.
+func TestBuildMarkdownKeepsCellsInsideTheirColumns(t *testing.T) {
+	body := buildMarkdown([]string{"a", "b"}, [][]string{{"x|y", "l1\nl2"}})
+	want := "| a | b |\n| --- | --- |\n| x\\|y | l1 l2 |\n"
+	if body != want {
+		t.Errorf("buildMarkdown =\n%q\nwant\n%q", body, want)
 	}
 }

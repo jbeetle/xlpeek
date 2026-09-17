@@ -1,5 +1,6 @@
 # Build output
 /bin/
+/dist/
 /xlpeek
 /xlpeek.exe
 /xlpeek-linux-*

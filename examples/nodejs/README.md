@@ -4,6 +4,11 @@ A wrapper around [xlpeek](https://github.com/jbeetle/xlpeek) for Node agents, pl
 the three stdio traps it exists to avoid. Every number below was measured, and
 `node test.js` re-measures them.
 
+The link above is the project's home and the Go module path
+(`github.com/jbeetle/xlpeek`); the binary's `version` output names the copyright
+holder, `henryyu@163.com`, who publishes under that account. Both refer to the
+same origin, and the whole thing is MIT licensed — see [LICENSE](../../LICENSE).
+
 ```bash
 node test.js          # 33 checks against the real binary
 ```

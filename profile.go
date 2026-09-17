@@ -245,7 +245,7 @@ func cmdProfile(args []string) int {
 		return code
 	}
 	if len(operands) != 1 {
-		return failUsage("profile", "expected exactly one workbook path")
+		return operandError("profile", operands, "exactly one workbook path")
 	}
 	if *headerRow < 0 {
 		return failUsage("profile", "--header-row must not be negative")
@@ -438,6 +438,7 @@ func cmdProfile(args []string) int {
 		}
 		result.Columns = append(result.Columns, profile)
 	}
+	result.Warnings = append(result.Warnings, filterWarnings(filters)...)
 	result.Warnings = append(result.Warnings, formulaWarnings...)
 	if capped {
 		result.Warnings = append(result.Warnings, fmt.Sprintf(

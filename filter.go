@@ -23,36 +23,128 @@ type filter struct {
 	num   float64
 	isNum bool
 	idx   int // resolved 0-based column index, -1 until resolved
+
+	// fallbacks and sample record cells that read as numbers but had to be
+	// compared as text, because the filter value does not read as one. That is
+	// the shape a mistyped numeric literal takes — "金额>1OO", the digit 0
+	// struck as the letter O — and the rows it matches are unrelated to the
+	// rows the caller meant to ask for. Counting them here is what lets the
+	// command that owns this filter say so.
+	fallbacks int
+	sample    string
 }
 
 // filterOps is ordered so that two-character operators are recognised before
 // their one-character prefixes.
 var filterOps = []string{">=", "<=", "!=", ">", "<", "=", "~"}
 
-// parseFilter parses an expression such as "金额>1000" or "状态~完成".
-func parseFilter(expr string) (*filter, error) {
-	for _, op := range filterOps {
-		i := strings.Index(expr, op)
-		if i <= 0 {
-			continue
-		}
-		f := &filter{
-			raw:   expr,
-			col:   strings.TrimSpace(expr[:i]),
-			op:    op,
-			value: strings.Trim(strings.TrimSpace(expr[i+len(op):]), `"'`),
-			idx:   -1,
-		}
-		if op != "~" {
-			if n, ok := parseNumber(f.value); ok {
-				f.num, f.isNum = n, true
+// filterForm is the shape every filter error restates, so that a caller who has
+// just had one rejected does not have to go and look it up.
+const filterForm = "expected <column><operator><value> using one of " +
+	">=, <=, !=, >, <, = or ~ (for example \"金额>1000\")"
+
+// operatorAt reports the position and text of the first operator in s, or -1
+// when it holds none. Operators are matched whole rather than by their leading
+// character, so that the "!" of "!= " is not an operator on its own — a value
+// like "hello!" is a value, while "hello!=" is a second comparison.
+func operatorAt(s string) (int, string) {
+	for i := 0; i < len(s); i++ {
+		for _, op := range filterOps {
+			if strings.HasPrefix(s[i:], op) {
+				return i, op
 			}
 		}
-		return f, nil
 	}
-	return nil, fmt.Errorf(
-		"invalid filter %q: expected <column><operator><value> using one of "+
-			">=, <=, !=, >, <, = or ~ (for example \"金额>1000\")", expr)
+	return -1, ""
+}
+
+// parseFilter parses an expression such as "金额>1000" or "状态~完成".
+//
+// The grammar is deliberately strict, because the alternative is not neutrality
+// but a plausible wrong answer: "金额>>100" used to be read as the value ">100"
+// and compared as text, and "金额>" — an operator with nothing after it — as
+// the value "", which every cell then compared greater than. Both returned
+// ok:true with a row count, and neither said the expression had not been
+// understood.
+func parseFilter(expr string) (*filter, error) {
+	at, op := operatorAt(expr)
+	if at < 0 {
+		return nil, fmt.Errorf("invalid filter %q: %s", expr, filterForm)
+	}
+	col := strings.TrimSpace(expr[:at])
+	if col == "" {
+		return nil, fmt.Errorf(
+			"invalid filter %q: no column before the operator at position %d; %s",
+			expr, at, filterForm)
+	}
+
+	raw := strings.TrimSpace(expr[at+len(op):])
+	if raw == "" {
+		return nil, fmt.Errorf(
+			"invalid filter %q: operator %q has no value after it; %s", expr, op, filterForm)
+	}
+	// Quoting is checked before the value is parsed, so that a filter for an
+	// empty cell — --where "备注=''" — stays expressible.
+	value, quoted := unquoteValue(raw)
+	if !quoted {
+		if _, second := operatorAt(value); second != "" {
+			return nil, fmt.Errorf(
+				"invalid filter %q: %q is a second operator, and a filter takes exactly one; "+
+					"if the value really holds one, quote it, as in %s%s'%s'",
+				expr, second, col, op, value)
+		}
+	}
+
+	f := &filter{raw: expr, col: col, op: op, value: value, idx: -1}
+	if op != "~" {
+		if n, ok := parseNumber(value); ok {
+			f.num, f.isNum = n, true
+		}
+	}
+	return f, nil
+}
+
+// unquoteValue removes one layer of matching quotes from a filter value and
+// reports whether it did. Quoting is how a value that contains an operator
+// character — the "a>b" of a substring search — gets past the grammar above,
+// and how an empty value is distinguished from a missing one.
+func unquoteValue(s string) (string, bool) {
+	if len(s) >= 2 {
+		for _, quote := range []byte{'"', '\''} {
+			if s[0] == quote && s[len(s)-1] == quote {
+				return s[1 : len(s)-1], true
+			}
+		}
+	}
+	return s, false
+}
+
+// filterWarnings reports the clauses whose comparison fell back to text
+// against cells that read as numbers. The count is what makes the warning
+// actionable: one such cell in a column of names is a coincidence, and every
+// cell is a typo in the filter value.
+func filterWarnings(filters []*filter) []string {
+	var warnings []string
+	for _, f := range filters {
+		if f.fallbacks == 0 {
+			continue
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"filter %q: the value %q is not a number, but %d cell(s) in column %q read as one "+
+				"(first: %q), so they were compared as text — ordered by their digits, not by "+
+				"their value; check the value for a typo, or use ~ to search the text deliberately",
+			f.raw, f.value, f.fallbacks, f.col, f.sample))
+	}
+	return warnings
+}
+
+// noteTextFallback records one numeric cell that a text comparison was applied
+// to, keeping the first as a sample.
+func (f *filter) noteTextFallback(cell string) {
+	if f.fallbacks == 0 {
+		f.sample = cell
+	}
+	f.fallbacks++
 }
 
 func parseFilterList(exprs []string) ([]*filter, error) {
@@ -100,8 +192,11 @@ func matchFilters(filters []*filter, cells []string) bool {
 // A numeric comparison is performed whenever the filter value parses as a
 // number: a cell that does not parse as a number then simply fails to match,
 // rather than silently falling back to comparing text. When the filter value
-// is not numeric the comparison is lexicographic. Equality and the substring
-// operator are case-insensitive, matching how spreadsheet auto-filters behave.
+// is not numeric the comparison is lexicographic, which is what makes a date
+// range work — but a cell that *is* numeric is counted on the way past, so the
+// clause can report that it answered by text something the caller probably
+// asked numerically. Equality and the substring operator are case-insensitive,
+// matching how spreadsheet auto-filters behave.
 func (f *filter) match(cell string) bool {
 	switch f.op {
 	case "~":
@@ -110,9 +205,12 @@ func (f *filter) match(cell string) bool {
 		equal := false
 		if f.isNum {
 			if n, ok := parseNumber(cell); ok {
-				equal = n == f.num
+				equal = equalNumeric(n, f.num)
 			}
 		} else {
+			if _, numeric := parseNumber(cell); numeric {
+				f.noteTextFallback(cell)
+			}
 			equal = strings.EqualFold(strings.TrimSpace(cell), f.value)
 		}
 		if f.op == "!=" {
@@ -120,15 +218,43 @@ func (f *filter) match(cell string) bool {
 		}
 		return equal
 	default:
+		n, ok := parseNumber(cell)
 		if f.isNum {
-			n, ok := parseNumber(cell)
 			if !ok {
 				return false
 			}
 			return compareNumeric(f.op, n, f.num)
 		}
-		return compareNumeric(f.op, float64(strings.Compare(cell, f.value)), 0)
+		if ok {
+			f.noteTextFallback(cell)
+		}
+		order := strings.Compare(cell, f.value)
+		switch f.op {
+		case ">":
+			return order > 0
+		case ">=":
+			return order >= 0
+		case "<":
+			return order < 0
+		case "<=":
+			return order <= 0
+		}
+		return false
 	}
+}
+
+// equalNumeric compares two numbers at the 15 significant digits this tool
+// reports its results in.
+//
+// A filter value written as a percentage is scaled by 0.01 when it is parsed,
+// and that product is not always the same double as the decimal it stands for:
+// 25.67/100 is one ulp away from the 0.2567 the cell holds, so an exact
+// comparison finds no row while the range comparisons beside it find one. The
+// reported precision is the right place to absorb that: it is the same
+// normalisation sums already go through, and it is far too narrow to make two
+// values that differ in any digit the tool reports compare equal.
+func equalNumeric(a, b float64) bool {
+	return roundToExcel(a) == roundToExcel(b)
 }
 
 func compareNumeric(op string, a, b float64) bool {

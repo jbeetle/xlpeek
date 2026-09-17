@@ -7,6 +7,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"math"
 	"sort"
@@ -155,6 +156,17 @@ const maxUnaccountedValues = 20
 // row per input row, which is the table again with extra steps, and the cost
 // lands in the caller's context rather than in this process.
 const aggGroupWarnThreshold = 1000
+
+// aggDefaultGroupLimit is how many groups come back when the caller does not
+// say.
+//
+// Zero — every group — was the old default, and it is the wrong one to fall
+// into: grouping by a near-unique column is a natural thing to do by accident,
+// and the response is then the whole table in a shape nobody reads, up to a
+// measured 181 KB. A caller who wants all of them still asks with --limit 0;
+// the default now costs one more call in the rare case and saves a flooded
+// context in the common one.
+const aggDefaultGroupLimit = 1000
 
 // hazardTokens name the kind of column that decides what a figure *means*
 // rather than how much of it there is. Summing across one of these is how a
@@ -350,17 +362,56 @@ func blankGroupWarning(groups map[string]*groupState, order []string, groupNames
 			"empty key%s", rows, hint)
 }
 
-// groupWarning explains an unbounded grouping that has stopped summarising.
-// It returns nothing when the caller capped the output themselves.
-func groupWarning(groups, limit int) string {
-	if limit > 0 || groups <= aggGroupWarnThreshold {
+// groupWarning explains a grouping that has stopped summarising. It returns
+// nothing when the caller capped the output themselves, because a deliberate
+// cap is not a mistake: the count and next_offset are in the response already.
+func groupWarning(groups, limit int, limitSet bool) string {
+	if groups <= aggGroupWarnThreshold || (limitSet && limit > 0) {
 		return ""
 	}
+	if limit > 0 {
+		return fmt.Sprintf(
+			"%d groups were produced and no --limit was given, so this response holds the first "+
+				"%d of them; grouping by a near-unique column returns the table rather than a "+
+				"summary — narrow it with --sort-by and --limit, follow next_offset, or pass "+
+				"--limit 0 to ask for all of them",
+			groups, limit)
+	}
 	return fmt.Sprintf(
-		"%d groups were produced and no --limit was given, so every one of them is in this "+
+		"%d groups were produced and --limit 0 asked for all of them, so every one is in this "+
 			"response; grouping by a near-unique column returns the table rather than a "+
 			"summary — set --limit, or group by something coarser",
 		groups)
+}
+
+// nearField names the field a caller probably meant, when the one they wrote
+// does not exist.
+//
+// The mistake it exists for is writing "sum_收入" for an aggregate the caller
+// named themselves: naming an output *replaces* the generated prefix rather
+// than joining it, so --sum "收入=[金额(万元)]" produces 收入, not sum_收入. That
+// rule is documented, and the naming is still easy to get wrong from memory,
+// which is the whole reason the error lists the fields that do exist. Naming
+// the near miss costs one line and saves a round trip.
+func nearField(id string, known []string) string {
+	trimmed := id
+	for _, prefix := range aggPrefix {
+		if strings.HasPrefix(id, prefix) {
+			trimmed = strings.TrimPrefix(id, prefix)
+			break
+		}
+	}
+	if trimmed == id {
+		return ""
+	}
+	for _, name := range known {
+		if name == trimmed {
+			return fmt.Sprintf(
+				"; did you mean %q? A field you name yourself is called exactly that name — the "+
+					"prefix is only added when you leave the naming to the tool", trimmed)
+		}
+	}
+	return ""
 }
 
 // validateUniqueFields rejects two outputs sharing a name.
@@ -435,8 +486,8 @@ func cmdAgg(args []string) int {
 	fillMerged := fs.Bool("fill-merged", false, "copy each merged region's value into every cell it spans; loads the sheet into memory")
 	offset := fs.Int("offset", 0, "output groups to skip")
 	fs.IntVar(offset, "o", 0, "output groups to skip (shorthand)")
-	limit := fs.Int("limit", 0, "maximum output groups; 0 means all")
-	fs.IntVar(limit, "l", 0, "maximum output groups (shorthand)")
+	limit := fs.Int("limit", aggDefaultGroupLimit, "maximum output groups; 0 means all")
+	fs.IntVar(limit, "l", aggDefaultGroupLimit, "maximum output groups (shorthand)")
 	password := fs.String("password", "", "password for an encrypted workbook")
 	raw := fs.Bool("raw", false, "aggregate stored values instead of number-formatted values")
 	tmpDir := fs.String("tmpdir", "", "directory for temporary files (default: system temp)")
@@ -456,7 +507,7 @@ func cmdAgg(args []string) int {
 		return code
 	}
 	if len(operands) != 1 {
-		return failUsage("agg", "expected exactly one workbook path")
+		return operandError("agg", operands, "exactly one workbook path")
 	}
 	if *headerRow < 0 {
 		return failUsage("agg", "--header-row must not be negative")
@@ -467,6 +518,15 @@ func cmdAgg(args []string) int {
 	if *limit < 0 {
 		return failUsage("agg", "--limit must not be negative")
 	}
+	// Whether the cap was chosen or defaulted decides what the response owes
+	// the caller: an explicit --limit is an answer, a defaulted one is a
+	// truncation that has to be explained.
+	limitSet := false
+	fs.Visit(func(set *flag.Flag) {
+		if set.Name == "limit" || set.Name == "l" {
+			limitSet = true
+		}
+	})
 
 	// Build the aggregate list. A leading "name=" renames the output field,
 	// which keeps a long expression from producing an unreadable key.
@@ -546,8 +606,8 @@ func cmdAgg(args []string) int {
 			for id := range used {
 				if !known[id] {
 					return failUsage("agg", fmt.Sprintf(
-						"--derive %q references %q, which is not one of the computed fields: %s",
-						d.source, id, strings.Join(fieldNames, ", ")))
+						"--derive %q references %q, which is not one of the computed fields: %s%s",
+						d.source, id, strings.Join(fieldNames, ", "), nearField(id, fieldNames)))
 				}
 			}
 		}
@@ -979,6 +1039,7 @@ func cmdAgg(args []string) int {
 	if warning := blankGroupWarning(groups, order, groupNames, *fillMerged); warning != "" {
 		result.Warnings = append(result.Warnings, warning)
 	}
+	result.Warnings = append(result.Warnings, filterWarnings(filters)...)
 	result.Warnings = append(result.Warnings, formulaWarnings...)
 	result.Warnings = append(result.Warnings, columnWarnings(
 		refNames, refPresent, refFilled, refUnits, numericRef, rowsMatched, *calc)...)
@@ -996,7 +1057,7 @@ func cmdAgg(args []string) int {
 			"%d of %d cells could not be read as numbers and were skipped",
 			nonNumeric, rowsMatched*max(1, numericCells)))
 	}
-	if warning := groupWarning(total, *limit); warning != "" {
+	if warning := groupWarning(total, *limit, limitSet); warning != "" {
 		result.Warnings = append(result.Warnings, warning)
 	}
 	result.Complete = !result.HasMore

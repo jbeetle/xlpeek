@@ -1,60 +1,87 @@
-Fixes for four ways the tool could return a result that looked fine and was not.
-All four were found by an external black-box review of 1.0.1, and each was
-reproduced here on a real workbook before it was fixed.
+Fixes for the fifteen findings of a second external review of 1.0.2. Three of
+them returned `ok: true` with a plausible wrong answer, and those are first: a
+mistyped filter value that silently became a text comparison, malformed filter
+expressions that returned a row count instead of an error, and paging that
+treated formatted empty rows as data.
 
 ### Fixed
 
-- **`--where` fell back to comparing text, silently.** A filter value carrying a
-  number format — `比率>20%`, `金额>¥2000` — did not parse as a number, so the
-  comparison became lexicographic: `5.00%` matched `>20%`, and `金额>$2000`
-  matched every row. Currency symbols, thousands separators and a trailing `%`
-  now parse, so the default path and `--raw` answer the same question. `%` is a
-  scale (`20%` is 0.2) and a currency symbol is presentation only — stripped,
-  never converted.
-- **`profile` typed formatted numeric columns as `text`.** `¥#,##0.00` and
-  `0.00%` columns reported no `min`/`max`/`mean` and looked like text on the
-  strength of their display format. Type inference now reads through the
-  format, so the same column is a number either way.
-- **A formula column with no cached value was silently empty.** Program-generated
-  workbooks (openpyxl, pandas, xlsxwriter) write no cached results, so `agg`
-  returned `null` with `warning_count: 0`. A referenced column that produces no
-  numeric values is now reported, and the message separates empty cells — which
-  is what an uncached formula looks like, and names `--calc` — from cells that
-  hold text.
-- **`--count-distinct` on a text column reported its values as skipped.** Cells
-  read only to be counted distinctly are no longer parsed as numbers, so a text
-  column no longer warns that "N of N cells could not be read as numbers".
-- **`agg` and `profile` accepted neither `--calc` nor `--fill-merged`.** Both
-  commands now take both, matching `read`: formulas evaluate, and a merged label
-  reaches the rows it covers instead of filing them under an empty key.
+- **A mistyped filter value silently turned a numeric comparison into a text
+  one.** `--where "金额>1OO"` — the digit 0 struck as the letter O — does not
+  read as a number, so the comparison fell back to comparing text and returned a
+  complete, plausible, wrong set of rows. The result is unchanged (dates need
+  text comparison) but the comparison is now counted, and the response carries a
+  warning naming the value, the column, the number of cells and a sample.
+- **Malformed filter expressions returned a row count instead of an error.**
+  `金额>>100` matched nothing, `金额>100>200` matched one row, and `金额>` —
+  read as the empty value, which every cell compares greater than — matched the
+  whole sheet. Filters are parsed strictly now; quoting is how a value that
+  really contains an operator is written.
+- **Paging counted position rather than content.** A sheet's last row is its last
+  *formatted* row, so a border dragged past the data produced blank pages with
+  `complete: false` and no way for a caller to stop. `has_more` and `complete`
+  now answer about content.
+- **`--derive` could not reference an aggregate of a bracketed column**, so a
+  ratio — what derived metrics exist for — could not be computed from
+  `--sum "[金额(万元)]"`. A bracketed run inside an operand is part of the
+  identifier now, and brackets nest.
+- **`agg --limit` defaulted to 0 (all groups).** It defaults to 1000, with
+  `has_more`/`next_offset` for the rest and a warning that says the default cut
+  it; `--limit 0` still asks for everything.
+- **`--raw --where "比率=25.67%"` missed.** Equality is compared at the 15
+  significant digits the tool reports in, which absorbs the one-ulp difference
+  between `25.67/100` and the `0.2567` the cell holds.
+- **A bad column name in a filter was reported as a runtime failure.** It is
+  exit 2 (`COLUMN_NOT_FOUND`) now, like every other error the command can fix;
+  sheet references moved with it. A missing file is still exit 1.
+- **`--ignore-case true` was rejected** and reported as a stray workbook path.
+  Boolean flags accept both words now, and the operand error names the arguments
+  it received.
 
 ### Added
 
-- `agg` warns when a referenced column mixed currencies while being summed, and
-  when rows were summarised under an empty grouping key (the merged-label case).
-- Aggregate expressions that fail on a column name carrying a parenthesis or a
-  space — `--sum "金额(万元)"` — now name the bracket escape in the error
-  (`[金额(万元)]`), and the escape is documented in README and docs/AGENTS.md.
-  Real workbooks use such names, and the error gave no way to find the fix.
-- `testdata/shapes.xlsx` and `examples/regression/regress_shapes.py`: a
-  committed fixture for the five shapes that produced these defects (a
-  ¥#,##0.00 money column, a 0.00% ratio column, an uncached formula column, a
-  label merged across rows, a column named `金额(万元)`, and a column of
-  percentage text), and a stdlib-only suite with hand-written expectations. The
-  existing suites all read one unformatted workbook, which is why none of this
-  was covered before.
-- `agg`/`profile` release their workbook through the session cache like every
-  other command, instead of closing a handle `serve` is holding.
+- **`--dates=display|iso|serial`** on `read` and `find`: `2026-01-01` instead of
+  `01-01-26` or `46023`, for callers that have to compare or sort dates. Opt-in,
+  because deciding which cells are dates means reading their number formats.
+- **`last_populated_row`** on `info --deep`: where the data actually ends.
+- **`find --offset`**, with `next_offset`, and a `truncated` settled by looking
+  one match ahead instead of assumed.
+- **`read --format csv|markdown`**, `--columns "A:D"` ranges, and `-s` by index.
+- `testdata/round2.xlsx` + `regress_round2.py`: one case per finding, most of
+  them asserting the error. The fixture is regenerable
+  (`examples/regression/make_fixtures.py`).
+- The regression suite checks its own delivery before its assertions: a missing
+  fixture or an unrunnable binary is reported once, by name.
+
+## Verification
+
+The bundle is assembled by `scripts/package_release.py`, which builds the four
+targets with the documented flags, copies the fixtures and suites in, **runs the
+full suite against the assembled copies**, and writes `SHA256SUMS` over
+everything shipped. `sha256sum -c SHA256SUMS` in the unpacked directory
+verifies it; nothing in it is generated after the checksums are taken.
+
+```bash
+python scripts/package_release.py --test    # what produced this release
+```
 
 ## Binaries
 
-`CGO_ENABLED=0` and `-trimpath`: statically linked, no runtime or C library needed alongside them, and rebuildable to the same bytes from this tag.
+`CGO_ENABLED=0`, `-trimpath` and `-buildvcs=false`: statically linked, no
+runtime or C library needed alongside them, no build-machine paths or git state
+inside, and rebuildable to the same bytes from this tag.
 
 | Asset | Platform | Size | SHA-256 |
 | --- | --- | --- | --- |
-| `xlpeek.exe` | Windows / amd64 | 14.2 MB | `7c23c1282c53e87f3d9dcf74b967287214c5dab0eac3682578688f52ce804df3` |
-| `xlpeek-linux-amd64` | Linux / amd64 | 14.1 MB | `927b0bc7b3f8a6550a0b98bcd2070d0908910d0db2111b55fd7a05646acce430` |
-| `xlpeek-linux-arm64` | Linux / arm64 | 13.0 MB | `bf08b189e66b3187c3bcf18e33dd482f56c2ed0338b2c6374977f44db4818d1b` |
-| `xlpeek-darwin-arm64` | macOS / arm64 | 13.3 MB | `2b7ee8adcb31e713983d2a08607d6c7d9ab564942832ea0fa085bbf6df0b9528` |
+| `xlpeek.exe` | Windows / amd64 | 14.3 MB | `54881c1cdfe415a1fd7a28b41eef38d4dca04d56ee6ccbdfbdc4dce61b1c5939` |
+| `xlpeek-linux-amd64` | Linux / amd64 | 14.1 MB | `535d62d88763c415f32b829c4941f80f24d5a10ffb8c928c4e5adaaa37b7367a` |
+| `xlpeek-linux-arm64` | Linux / arm64 | 13.0 MB | `21e73452ad06f6193526bc8cf397df626aec058f015853fb96dff81da65e59cf` |
+| `xlpeek-darwin-arm64` | macOS / arm64 | 13.4 MB | `be2ffc3f71bc51dcc7df793f635148951c3db9fc49f032e8ae117f18daf1678e` |
 
-Install from source instead: `go install github.com/jbeetle/xlpeek@v1.0.2`.
+The 1.0.3 bundle is `xlpeek-1.0.3.zip`, 30.5 MB, holding 45 files: the four
+binaries above, `testdata/`, the suites, the docs and the licence. Its own
+SHA-256 travels with the delivery rather than in this file — a checksum of a
+file printed inside that file can never be right — and every file it contains is
+listed in the `SHA256SUMS` beside them.
+
+Install from source instead: `go install github.com/jbeetle/xlpeek@v1.0.3`.
