@@ -1,19 +1,26 @@
-A documentation fix, and nothing else. The envelope examples in
-`docs/AGENTS.md` still showed `"version":"1.1.0"` after 1.2.0 shipped — the
-first thing anyone checking a delivery looks at, and the one thing the SHA256
-of a bundle cannot tell you.
+A wording fix in one warning, and nothing else.
 
-No command behaves differently, no output field changed, and every suite that
-passed against 1.2.0 passes against this. The binaries differ from 1.2.0's
-because the version string is compiled into them, which is also why this is a
-release rather than an amended one: what you download and what the tag points
-at stay the same thing.
+The hidden-row warning said the rows had been "hidden by hand". That is a cause
+it cannot know: excelize's streaming iterator carries the `hidden` attribute and
+not `outlineLevel`, so a row collapsed under an outline group, a row a saved
+filter removed and a row someone hid are indistinguishable from inside the
+file. The message now states what the file holds — how many rows, and where the
+first one is — and names the three ways a row gets there without choosing one:
+
+    2 of the 6 rows this answer read are hidden in the sheet (first: row 3);
+    a saved filter, a collapsed outline group and a row hidden by hand all leave
+    the same mark in the file — Excel shows a view without them while this
+    answer includes them, so pass --visible-only to read what the sheet shows
+
+Found while writing the delivery note for this batch, by checking the claim
+against the library source rather than against the output. No command behaves
+differently and no figure changes.
 
 ### Fixed
 
-- `docs/AGENTS.md` shows the version this release actually is, in the two places
-  it prints an envelope.
-- `CHANGELOG.md` gained the `[1.2.1]` entry and the compare links that go with it.
+- The hidden-row warning names the possibilities instead of asserting a cause.
+- `docs/AGENTS.md` and `README.md` say the warning reports how many rows are
+  hidden and where the first one is, which is what it does.
 
 ## Verification
 
@@ -28,10 +35,9 @@ python scripts/package_release.py --test    # what produced this release
 ```
 
 Fourteen suites, 64 unit tests, and the Node wrapper's 33 checks. What each
-suite covers is listed in `README.md`; the office shapes this release's
-predecessor added are in `testdata/office.xlsx`, asserted in
-`examples/regression/regress_office.py` against what the person looking at the
-sheet would say.
+suite covers is listed in `README.md`; the office shapes this batch added are in
+`testdata/office.xlsx`, asserted in `examples/regression/regress_office.py`
+against what the person looking at the sheet would say.
 
 ## Binaries
 
@@ -41,15 +47,15 @@ inside, and rebuildable to the same bytes from this tag.
 
 | Asset | Platform | Size | SHA-256 |
 | --- | --- | --- | --- |
-| `xlpeek.exe` | Windows / amd64 | 14.4 MB | `4aca174e44d59a9d09509df18d1526479bccaba7d97ea146a6d5ece940745737` |
-| `xlpeek-linux-amd64` | Linux / amd64 | 14.3 MB | `1bfa8ddb8b50a27d8296c0433275bee21813c30deb6f6462c53d9411beb6a226` |
-| `xlpeek-linux-arm64` | Linux / arm64 | 13.2 MB | `6236b7f5217a8b8ddd6d3e8d42e4a813b8bf736102d1f10b5a1f7151ab6c59c6` |
-| `xlpeek-darwin-arm64` | macOS / arm64 | 13.5 MB | `0ebba1253e12a0c30d5506170f435a9da97dbf5e29cd56ed78b4a170741cba7c` |
+| `xlpeek.exe` | Windows / amd64 | 14.4 MB | `961c1e74ff59c7e67d8ecbb83228599440296887a0db9f75841095bb95b6119a` |
+| `xlpeek-linux-amd64` | Linux / amd64 | 14.3 MB | `e19a2af51d9c6038e6c8f2bbbc6e813fd8238c64b531d5b8ef9cdccb263d0758` |
+| `xlpeek-linux-arm64` | Linux / arm64 | 13.2 MB | `787a1d5e9bedbc247aba9b920062cf9489f7e96b47080113f0d3fb91ff7cf7b8` |
+| `xlpeek-darwin-arm64` | macOS / arm64 | 13.5 MB | `132d91f668511985452a07856aa92de7ce7987858db4bf1d6b7acbf0719212a5` |
 
-The 1.2.1 bundle is `xlpeek-1.2.1.zip`, 29.5 MB, holding 48 files: the four
+The 1.2.2 bundle is `xlpeek-1.2.2.zip`, 29.5 MB, holding 48 files: the four
 binaries above, `testdata/`, the suites, the docs and the licence. Its own
 SHA-256 travels with the delivery rather than in this file — a checksum of a
 file printed inside that file can never be right — and every file it contains is
 listed in the `SHA256SUMS` beside them.
 
-Install from source instead: `go install github.com/jbeetle/xlpeek@v1.2.1`.
+Install from source instead: `go install github.com/jbeetle/xlpeek@v1.2.2`.

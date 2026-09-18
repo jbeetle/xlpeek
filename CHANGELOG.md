@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-09-18
+
+A wording fix in the hidden-row warning. It said the rows had been hidden by
+hand — a cause it cannot know: excelize's streaming iterator carries `hidden`
+but not `outlineLevel`, so a row collapsed under an outline group and a row the
+filter removed are indistinguishable from here. The message now states what the
+file holds (how many rows, and where the first one is) and names the three ways
+a row gets there without picking one.
+
+Found while writing the delivery note for this batch, by checking the claim
+against the library's source rather than against the output.
+
 ## [1.2.1] - 2026-09-18
 
 A documentation fix, and nothing else: the envelope examples in
@@ -353,7 +365,8 @@ Behaviour aimed at a caller that cannot see the data itself:
 - Error codes distinguish `PASSWORD_REQUIRED` from `INVALID_PASSWORD`, and name
   the available sheets or columns so a caller can correct itself in one step.
 
-[Unreleased]: https://github.com/jbeetle/xlpeek/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/jbeetle/xlpeek/compare/v1.2.2...HEAD
+[1.2.2]: https://github.com/jbeetle/xlpeek/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/jbeetle/xlpeek/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/jbeetle/xlpeek/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/jbeetle/xlpeek/compare/v1.0.3...v1.1.0

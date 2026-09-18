@@ -28,8 +28,8 @@
 每次调用往 stdout 写且只写一个 JSON：
 
 ```json
-{"ok":true,"command":"read","version":"1.2.1","data":{ ... }}
-{"ok":false,"command":"read","version":"1.2.1","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
+{"ok":true,"command":"read","version":"1.2.2","data":{ ... }}
+{"ok":false,"command":"read","version":"1.2.2","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
 ```
 
 - **错误也在 stdout**，所以只有一个解析路径。先看 `ok`。
@@ -679,7 +679,7 @@ xlpeek read book.xlsx -s 明细 --header --dates iso -l 1000
 Excel 里"筛选后的视图 / 折叠的分组 / 报表自己写的小计行"都和文件本身不一样。三条实测：
 
 - **隐藏行**（筛选后保存、折叠大纲、手动隐藏）：行还在文件里，Excel 里看不见。
-  `agg --sum 金额` 默认把它们算进去——数字对、口径不对——并在 `warnings` 里说明有几行、为什么隐藏。
+  `agg --sum 金额` 默认把它们算进去——数字对、口径不对——并在 `warnings` 里说明有几行、第一行在第几行。
   要**屏幕上那个数**就加 `--visible-only`；不确定有没有先看 `info --deep` 的 `hidden_rows`。
 - **小计/合计行**：报表把 `小计`、`合计`、`总计`、`累计`、`其中` 写在自己的明细列里，
   直接求和等于把同一笔钱算两遍（随包夹具实测 **1700**，而报表自己写的是 **700**）。

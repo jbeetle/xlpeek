@@ -155,8 +155,11 @@ def office_hidden_rows(wb):
 
     The rows a filter removed are still in the file — hidden, which is how Excel
     writes a filtered row. The total on screen is 1600; the total over the file
-    is 2100, and until 1.2.0 nothing said which one was being answered. B is
-    hidden by hand and C by an outline group, so the two reasons are told apart.
+    is 2100, and until 1.2.0 nothing said which one was being answered.
+
+    C is written with an outline level as well as hidden, which is what a
+    collapsed group looks like — the file does not say which of the three ways
+    put a row there, and neither does the warning.
     """
     ws = wb.create_sheet("隐藏行")
     ws.append(["项目", "金额"])

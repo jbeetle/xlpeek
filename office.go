@@ -35,7 +35,6 @@ import (
 // and no memory.
 type rowVisibility struct {
 	hidden      int
-	outline     int
 	firstHidden int
 	// set is only built when a caller asks to skip hidden rows, which needs to
 	// know *which* rows rather than how many. A sheet where a filter hid most of
@@ -57,9 +56,6 @@ func (v *rowVisibility) note(row int, opts excelize.RowOpts) {
 		return
 	}
 	v.hidden++
-	if opts.OutlineLevel > 0 {
-		v.outline++
-	}
 	if v.firstHidden < 0 {
 		v.firstHidden = row
 	}
@@ -85,30 +81,31 @@ func (v *rowVisibility) skippedNote() string {
 }
 
 // warning explains the gap between the sheet and the screen.
+//
+// It names the possibilities rather than picking one, because the file does not
+// distinguish them: a saved filter, a collapsed outline group and a row hidden
+// by hand all leave the same attribute, and the streaming iterator carries that
+// attribute and nothing else. Saying "someone hid them by hand" would be a
+// guess presented as a fact.
 func (v *rowVisibility) warning(rowsScanned int) string {
 	if v == nil || v.hidden == 0 {
 		return ""
 	}
-	reason := "someone hid them by hand"
-	switch {
-	case v.outline == v.hidden:
-		reason = "they are collapsed under an outline group"
-	case v.outline > 0:
-		reason = "some are collapsed under an outline group and some were hidden by hand"
-	}
+	const why = "a saved filter, a collapsed outline group and a row hidden by hand all leave the " +
+		"same mark in the file"
 	if rowsScanned > 0 && v.hidden >= rowsScanned {
 		// Every row it saw is hidden, which is what a filtered view that kept
 		// nothing looks like — worth saying without the arithmetic.
 		return fmt.Sprintf(
-			"every one of the %s this answer read is hidden in the sheet (%s), so Excel shows a "+
-				"view without them while this answer includes them; pass --visible-only to read "+
-				"what the sheet shows", rowsPhrase(rowsScanned), reason)
+			"every one of the %s this answer read is hidden in the sheet, so Excel shows a view "+
+				"without them while this answer includes them; pass --visible-only to read what "+
+				"the sheet shows", rowsPhrase(rowsScanned))
 	}
 	return fmt.Sprintf(
-		"%d of the %s this answer read are hidden in the sheet (%s), so Excel shows a view "+
-			"without them while this answer includes them; pass --visible-only to read what the "+
-			"sheet shows",
-		v.hidden, rowsPhrase(rowsScanned), reason)
+		"%d of the %s this answer read are hidden in the sheet (first: row %d); %s — Excel shows "+
+			"a view without them while this answer includes them, so pass --visible-only to read "+
+			"what the sheet shows",
+		v.hidden, rowsPhrase(rowsScanned), v.firstHidden, why)
 }
 
 // visibilityNote picks the sentence a scan owes about hidden rows: what it left
