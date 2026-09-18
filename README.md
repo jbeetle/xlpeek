@@ -98,7 +98,7 @@ covers how it is meant to be *driven*, and how it is checked:
 | [docs/SYSTEM_PROMPT.md](docs/SYSTEM_PROMPT.md) | paste into an agent's system prompt | ~1,000 tokens |
 | [docs/AGENTS.md](docs/AGENTS.md) | the agent's reference, loaded on demand | ~9,500 tokens |
 | [examples/nodejs](examples/nodejs) | a Node wrapper and the stdio traps it avoids | |
-| [examples/regression](examples/regression) | thirteen cross-validation suites, `run_all.py` | |
+| [examples/regression](examples/regression) | fourteen cross-validation suites, `run_all.py` | |
 
 The first two exist because an agent that does not know the traps will walk into
 them confidently — the units-and-currencies case above is not hypothetical, it
@@ -141,7 +141,7 @@ That builds the four targets with the flags above, copies in `testdata/`, the
 suites, the docs and the licence, **runs the whole suite against the assembled
 copies**, and writes a `SHA256SUMS` over everything shipped. Unpack it anywhere
 and `sha256sum -c SHA256SUMS` verifies it; run
-`python examples/regression/run_all.py` inside it and the thirteen suites run off
+`python examples/regression/run_all.py` inside it and the fourteen suites run off
 the bundled binary and the bundled fixtures, with nothing to install.
 
 ### Provenance
@@ -175,7 +175,7 @@ table after the envelope, so only the first line parses as JSON.
 ## Testing
 
 ```bash
-go test .            # 58 unit tests
+go test .            # 64 unit tests
 python examples/regression/run_all.py   # the suites below, ~75s
 ```
 
@@ -183,7 +183,7 @@ python examples/regression/run_all.py   # the suites below, ~75s
 [`examples/regression`](examples/regression) cover what unit tests cannot:
 **cross-validation against an independent XML parser**, behaviour on real and
 malformed files, and whether the commands written in these docs actually run.
-Thirteen suites, exit code is the verdict:
+Fourteen suites, exit code is the verdict:
 
 | | |
 | --- | --- |
@@ -194,6 +194,7 @@ Thirteen suites, exit code is the verdict:
 | `regress_precision` | every difference from the raw XML explained by 15-digit normalisation |
 | `regress_shapes` | the shapes a real report has — ¥/`%` formats, uncached formulas, merged labels, bracketed column names, percentage text |
 | `regress_round2` | one case per finding of the second external review, most of them asserting the *error* |
+| `regress_office` | the office habits that change an answer silently — a view saved from a filter, subtotals written into the detail column, a two-level header, figures pasted in full-width — each asserted against what the person looking at the sheet would say |
 | `regress_round3` | the third round's three capabilities, each against a hand-sized sheet, and the boundary: a volatile function refused, an unimplemented one named, a failed row distinguishable from an empty one, and no scratch worksheet left behind |
 | `verify_docs` | every command in docs/AGENTS.md and this file, actually executed |
 | `regress_small` | ten files × seven commands: no panic, valid envelope, no null arrays |
@@ -218,8 +219,8 @@ Every invocation writes **exactly one JSON envelope to stdout** and nothing
 else. This holds on the failure path too, so a caller has a single parse path.
 
 ```json
-{"ok":true,"command":"read","version":"1.1.0","data":{ ... }}
-{"ok":false,"command":"read","version":"1.1.0","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
+{"ok":true,"command":"read","version":"1.2.0","data":{ ... }}
+{"ok":false,"command":"read","version":"1.2.0","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
 ```
 
 Exit codes: `0` success, `1` runtime failure, `2` usage failure. The distinction
@@ -234,8 +235,8 @@ stderr is human-oriented noise, such as the flag package's own diagnostics.
 call, and it carries the copyright alongside the number:
 
 ```json
-{"ok":true,"command":"version","version":"1.1.0",
- "data":{"name":"xlpeek","version":"1.1.0",
+{"ok":true,"command":"version","version":"1.2.0",
+ "data":{"name":"xlpeek","version":"1.2.0",
          "copyright":"Copyright (c) 2026 henryyu@163.com. All rights reserved."}}
 ```
 
@@ -878,6 +879,80 @@ blanks in it, a group filed under an empty key, a fill rate that is really a
 merge. `agg` names the empty group when it sees one, so the case is visible even
 without the flag. `--deep` surfaces merged regions because it is easy not to know
 they are there.
+
+## The sheet and the screen
+
+A spreadsheet is not only data. It is a view of data, and the view is what the
+person who asked the question is looking at — a filter left on, an outline group
+collapsed, a subtotal row written under the detail it totals. Reading the file
+faithfully then produces a number that is arithmetically right and not the answer
+to the question, which is the failure this tool exists to refuse to pass on.
+
+**Rows the sheet hides.** A saved filter, a collapsed outline and a row hidden by
+hand all leave `hidden="1"` on the row. The streaming iterator carries that
+attribute, so the count is free — but the difference is not:
+
+```bash
+xlpeek agg book.xlsx -s 明细 --header --sum 收入金额 --count
+#   … and a warning saying how many of the rows it read the sheet hides
+xlpeek agg book.xlsx -s 明细 --header --sum 收入金额 --count --visible-only
+#   … the total the sheet shows, and how many rows it skipped to get there
+```
+
+`--visible-only` is on `read`, `agg`, `profile` and `find`; `info --deep`
+reports `hidden_rows` so a caller can see it before asking.
+
+**Subtotal rows.** A report that writes `小计` / `合计` / `总计` / `累计` / `其中`
+(or `subtotal` / `total`) into its own detail column is summing rows that are
+already in that column. Including them counts the same money twice:
+
+```bash
+xlpeek agg book.xlsx -s 明细 --header --sum 金额 --count
+#   … and names the rows that look like the report's own totals
+xlpeek agg book.xlsx -s 明细 --header --sum 金额 --count --exclude-totals
+#   … the detail on its own, which is the figure the report itself states
+```
+
+The check reads the first cell of each row that holds anything — where a report
+writes its label — and accepts a scope after a colon (`小计：华东`), but not a
+longer word: `合计额` is a column heading, not a total.
+
+**A header written on two rows.** A title merged over the columns it groups is
+the shape of most real reports, and the name a caller needs is the two rows
+together:
+
+```bash
+xlpeek agg testdata/office.xlsx -s 两级表头 --header --header-rows 2 --sum 2024年金额 --count
+xlpeek read testdata/office.xlsx -s 两级表头 --header --header-rows 2 --fill-merged     --columns 部门,2024年数量
+```
+
+The parts are joined with nothing between them, because a separator would be an
+operator inside a column name — `--sum 2024年-金额` is arithmetic. Excel keeps a
+merged title only in the first cell of the region, so `--fill-merged` is what
+gives the second column under it a name. `--header-rows` is accepted by `read`,
+`agg`, `profile`, `find` and `info`.
+
+**Figures pasted in from elsewhere.** `１２３４` and `１，２３４` are what a number
+looks like after Word or WeChat, and they were text to every parser: the column
+totalled 500 instead of 2968, with only the skipped-cell count hinting at it.
+Full-width digits, comma, period, percent sign and signs are read as their ASCII
+equivalents now. Nothing else about a value changes.
+
+All four shapes have a sheet in `testdata/office.xlsx` and an assertion in
+`examples/regression/regress_office.py`, which states the numbers rather than
+describing them: 1600 against 2100 for the hidden rows, 700 against 1700 for the
+subtotals, 2968 against 500 for the full-width figures.
+
+**Which version of the file?** Every response carries `file_size` and
+`file_mtime`, and `--fingerprint` adds `file_sha256`:
+
+```bash
+xlpeek agg book.xlsx -s 明细 --header --sum 收入金额 --fingerprint
+```
+
+That is the one that survives a copy, a rename or a checkout, and it is what
+makes a figure reconcilable a week later: the number and the file it came from
+travel together.
 
 ## Output formats
 

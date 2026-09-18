@@ -48,7 +48,7 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o bin/xlpeek.exe .
 Behavioural suites (Python 3.7+; not part of `go test`):
 
 ```bash
-python examples/regression/run_all.py     # all thirteen suites, ~110s, exit code is the verdict
+python examples/regression/run_all.py     # all fourteen suites, ~130s, exit code is the verdict
 python examples/regression/regress_agg.py # one suite
 XLPEEK=/path/to/xlpeek python run_all.py  # test a specific build
 node examples/nodejs/test.js              # 33 Node-wrapper checks
@@ -98,6 +98,7 @@ the stdlib `flag` package stops at the first positional.
 | `dates.go` | `--dates`: number-format inspection and date serialisation |
 | `serve.go` | the stdio line protocol and `ping` |
 | `formula.go` | `--col` / `--agg`: the formula scanner, the scratch-sheet engine, volatile-function refusal |
+| `office.go` | the spreadsheets habits that change an answer: hidden rows, subtotal rows, two-level headers |
 
 ### The output contract (`output.go`)
 
@@ -213,6 +214,15 @@ chart reading (excelize has no chart getter), and `--sheets` as the lowest prior
 optional items. What it asks for in §5 is the part that became the boundary work in
 `regress_round3.py`: volatile functions refused, unimplemented ones named, a failed row
 distinguishable from an empty one.
+
+`bugs/roadmap-office-gaps.md` (2026-09-18) is the internal counterpart to all of that: the office
+habits that make an answer disagree with what the person looking at the sheet sees, each with a
+measured repro and a source-verified feasibility note. Its first batch shipped as 1.2.0 (hidden
+rows, subtotal rows, two-level headers, file fingerprint, full-width digits) and is asserted in
+`examples/regression/regress_office.py` against `testdata/office.xlsx`, where the expectations are
+stated as the numbers the person would read off the screen. The rest of the list — multi-sheet
+union, CSV import, cell fill colours, pivot-table definitions — is unstarted and ordered by
+frequency times risk.
 
 `bugs/round3/xlpeek-remediation-request-round3.md` also carries the client's own measurements,
 which are optimistic in one place worth knowing about: their 0.02 ms/row for a per-row formula

@@ -345,23 +345,28 @@ type sheetScan struct {
 	lastRow          int
 	populatedRows    int
 	lastPopulatedRow int
+	// hiddenRows is the count of rows the sheet hides. It is only meaningful for
+	// a deep scan, which is the only one that walks every row.
+	hiddenRows int
 }
 
 // scanSheet walks a worksheet in streaming order. When deep is false it stops
 // as soon as the header and requested sample rows have been read; when deep is
 // true it walks every row to produce exact counts.
-func scanSheet(f *excelize.File, sheet string, headerRow, sampleRows int, deep bool) (*sheetScan, error) {
+func scanSheet(f *excelize.File, sheet string, headerRow, headerRows, sampleRows int, deep bool) (*sheetScan, error) {
 	iter, err := f.Rows(sheet)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = iter.Close() }()
 
+	headerRows = max(1, headerRows)
 	firstDataRow := 1
 	if headerRow > 0 {
-		firstDataRow = headerRow + 1
+		firstDataRow = headerRow + headerRows
 	}
 	scan := &sheetScan{deep: deep}
+	var headerRowsRead [][]string
 	pos := 0
 	for iter.Next() {
 		pos++
@@ -369,8 +374,16 @@ func scanSheet(f *excelize.File, sheet string, headerRow, sampleRows int, deep b
 		if err != nil {
 			return nil, err
 		}
-		if headerRow > 0 && pos == headerRow {
-			scan.header = cells
+		if iter.GetRowOpts().Hidden {
+			scan.hiddenRows++
+		}
+		if headerRow > 0 && pos >= headerRow && pos < headerRow+headerRows {
+			headerRowsRead = append(headerRowsRead, cells)
+			if pos == headerRow+headerRows-1 {
+				scan.header = mergeHeaderRows(headerRowsRead)
+			}
+			// No continue: a header row holds content, and the counts below are
+			// about the sheet rather than about the data.
 		}
 		if len(cells) > scan.maxColumn {
 			scan.maxColumn = len(cells)
@@ -544,6 +557,12 @@ type pageRequest struct {
 	fillMerged bool
 	dates      string
 	maxColumns int
+	// headerRows is how many rows the header spans; 0 or 1 is the ordinary case.
+	headerRows int
+	// visibleOnly drops rows the sheet hides, and excludeTotals drops rows that
+	// look like the report's own subtotal lines.
+	visibleOnly   bool
+	excludeTotals bool
 	// colArgs are the --col formulas as the caller wrote them. They are scanned
 	// inside readPage because the header they name columns from is only read
 	// there, and cols holds the result.
@@ -570,6 +589,9 @@ type pageResult struct {
 	// derivedNames are their column names.
 	derived      [][]string
 	derivedNames []string
+	// hiddenRows are the rows the sheet hides, kept only when --visible-only
+	// asks to skip them.
+	hiddenRows map[int]bool
 }
 
 // readPage streams one page out of a worksheet.
@@ -587,9 +609,16 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 	defer func() { _ = iter.Close() }()
 
 	res := &pageResult{sheet: req.sheet, sheetIndex: req.sheetIndex}
+	headerRows := max(1, req.headerRows)
+	visibility := newRowVisibility(req.visibleOnly)
+	var (
+		subtotals      subtotalCounters
+		headerRowsRead [][]string
+	)
+	res.hiddenRows = visibility.set
 	firstDataRow := 1
 	if req.headerRow > 0 {
-		firstDataRow = req.headerRow + 1
+		firstDataRow = req.headerRow + headerRows
 	} else {
 		if len(req.colArgs) > 0 {
 			return nil, usageFailure(errors.New(
@@ -653,11 +682,16 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 			}
 		}
 		if pos < firstDataRow {
-			if req.headerRow > 0 && pos == req.headerRow {
-				if res.header, err = iter.Columns(); err != nil {
+			if req.headerRow > 0 && pos >= req.headerRow {
+				var headerRow []string
+				if headerRow, err = iter.Columns(); err != nil {
 					return nil, err
 				}
-				res.header = applyMerges(pos, res.header)
+				headerRowsRead = append(headerRowsRead, applyMerges(pos, headerRow))
+				if pos < req.headerRow+headerRows-1 {
+					continue // another header row follows
+				}
+				res.header = mergeHeaderRows(headerRowsRead)
 				// The --col formulas are scanned here because this is the first
 				// moment their column names can be resolved, and they are scanned
 				// before the filters because a filter may name one of them.
@@ -708,6 +742,14 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 			// being repeated for every row left in the sheet.
 			return nil, usageFailure(err)
 		}
+		// The row's own attributes: whether the sheet hides it, and whether its
+		// first cell reads like the report's own subtotal line.
+		visibility.note(pos, iter.GetRowOpts())
+		summary := subtotalLabel(cells)
+		if req.excludeTotals && summary != "" {
+			subtotals.note(pos, summary, true)
+			continue
+		}
 		if len(res.rows) == req.limit {
 			// The page is complete. Keep going, but only to establish whether
 			// another matching row exists, and give up after a bounded number
@@ -727,6 +769,9 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 		// begin with 18 blank rows and one stray formatted row at the bottom
 		// would pad every page out to a million.
 		if req.skipEmpty && !nonEmpty(cells) {
+			continue
+		}
+		if req.visibleOnly && visibility.hiddenRow(pos) {
 			continue
 		}
 		if skipped < req.offset {
@@ -758,6 +803,7 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 		res.lastRow = pos
 		res.rows = append(res.rows, cells)
 		res.derived = append(res.derived, rowDerived)
+		subtotals.note(pos, summary, false)
 	}
 	if err = iter.Error(); err != nil {
 		return nil, err
@@ -766,6 +812,12 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 	// so here, once, rather than in the result set where it cannot be seen.
 	res.warnings = append(res.warnings, filterWarnings(req.filters)...)
 	res.warnings = append(res.warnings, req.cols.warnings()...)
+	if warning := visibilityNote(visibility, req.visibleOnly, res.scanned); warning != "" {
+		res.warnings = append(res.warnings, warning)
+	}
+	if warning := totalsNote(&subtotals, req.excludeTotals, res.scanned); warning != "" {
+		res.warnings = append(res.warnings, warning)
+	}
 
 	// Pad every row to a common width so the page has a stable shape. The
 	// width comes from the rows actually returned rather than from the

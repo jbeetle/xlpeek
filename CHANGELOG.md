@@ -6,6 +6,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-18
+
+The first release that comes from our own review rather than a client finding.
+It closes the gap between *what the file holds* and *what the person looking at
+the sheet sees*, which is where a correct number stops being the answer to the
+question: a view saved from a filter, a report that writes its own subtotals
+into the detail column, a title row merged over the column names. Each was
+measured first — the hidden-row sheet totalled 2100 where Excel says 1600, the
+subtotal sheet 1700 where the report itself says 700 — and each is now either
+reported or avoidable by flag.
+
+### Added
+
+- **Hidden rows are counted, and can be skipped.** A saved filter, a collapsed
+  outline group and a row hidden by hand all leave `hidden="1"` on the row; the
+  streaming iterator already carries it, so counting costs one comparison per
+  row. When an answer read rows the sheet hides, the response says how many and
+  why they were hidden, and `--visible-only` reads the view instead of the file.
+  `info --deep` reports `hidden_rows`.
+- **Subtotal rows are named, and can be dropped.** A row whose first cell reads
+  小计 / 合计 / 总计 / 累计 / 其中 / subtotal / total — optionally followed by a
+  scope, as in `小计：华东` — is the report's own summary of other rows, and
+  summing the column counts it twice. It is reported by name and row number, and
+  `--exclude-totals` leaves it out.
+- **`--header-rows N` reads a two-level header.** A title row merged over the
+  columns it groups is the shape of most real reports; the span is joined into
+  one name per column (`2024年` + `金额` → `2024年金额`), with `--fill-merged`
+  spreading a merged title to the columns it covers. Available on `read`, `agg`,
+  `profile`, `find` and `info`.
+- **Every response carries the file's fingerprint.** `file_size` and
+  `file_mtime` are free and always present; `--fingerprint` adds `file_sha256`
+  so that a figure can be traced to the version of the workbook that produced
+  it. A digest of a file printed inside that file can never be right, but the
+  digest *of the workbook* belongs with the answer.
+- **Full-width digits are numbers.** `１２３４` and `１，２３４` — what a figure
+  looks like after Word or WeChat — were text to every parser, so a column
+  totalled 500 instead of 2968 and only the skipped-cell count hinted at it.
+  Digits, the comma, the period, the percent sign and the signs are normalised;
+  nothing else changes.
+
+### Changed
+
+- A misread filter value that only ever affected parsing is unchanged, but the
+  two new row guards are opt-out rather than opt-in: they change what a caller
+  is told, never what is counted unless a flag asks for it.
+
 ## [1.1.0] - 2026-09-18
 
 The third external review was a capability request rather than a defect report:
@@ -299,7 +345,8 @@ Behaviour aimed at a caller that cannot see the data itself:
 - Error codes distinguish `PASSWORD_REQUIRED` from `INVALID_PASSWORD`, and name
   the available sheets or columns so a caller can correct itself in one step.
 
-[Unreleased]: https://github.com/jbeetle/xlpeek/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/jbeetle/xlpeek/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/jbeetle/xlpeek/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/jbeetle/xlpeek/compare/v1.0.3...v1.1.0
 [1.0.3]: https://github.com/jbeetle/xlpeek/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/jbeetle/xlpeek/compare/v1.0.1...v1.0.2

@@ -140,6 +140,10 @@ xlpeek read book.xlsx -s 明细 --header --col "月=MONTH(过账日期)" --where
 `--col "名字=公式"` 是逐行计算的派生列（详见下面 `agg` 一节的「公式」），
 它排在原表各列之后，列名进入 `header` 与 `derived_columns`，可以被 `--where` `--columns` 引用。
 
+`read` 与 `agg` / `profile` / `find` 一样接受 **`--visible-only`**（只读屏幕上可见的行）、
+**`--exclude-totals`**（丢掉报表自己的小计行）与 **`--header-rows N`**（两级表头）——
+这三个都是「文件里有、Excel 里看不到」的坑，见第五节 陷阱 11。
+
 分页元数据是自驱动的：
 
 ```json
@@ -231,6 +235,13 @@ xlpeek agg book.xlsx -s 明细 --header --sum "[金额(万元)]" --sum "[成本(
   默认模式与 `--raw` 得到同一个数。要在完整存储精度上算，仍用 `--raw`。
 - `--calc` 与 `--fill-merged` 的含义和 `read` 完全相同（求无缓存公式 / 把合并区值填进所跨单元格），
   两者都会让 excelize 载入整张表，因此都是显式 opt-in。
+- **隐藏行与小计行**（1.2.0 起）：文件里隐藏的行默认**仍会被算进去**，报表自己写的
+  `小计/合计` 行也会被当明细再加一遍——两者都会在 `warnings` 里说明并给出一句话的解法，
+  `--visible-only` / `--exclude-totals` 可一键切换。**报数字之前先读这两条告警。**
+- **`--header-rows N`**：表头占两行时（标题行跨在列名上）用它；列名是两行拼起来的
+  （`2024年`+`金额` → `2024年金额`），合并的标题要靠 `--fill-merged` 才能覆盖到合并区的其余列。
+- **`--fingerprint`**：响应多一个 `file_sha256`；`file_size` / `file_mtime` 则是每个响应都有的，
+  用来把数字和"哪一版文件"绑在一起。
 - **三条"数字对、前提错"的告警**（都在 `warnings` 里，都会让 `warning_count > 0`）：
   引用的列**一个可用数值都没有**（聚合结果是 `null`；消息会区分"单元格是空的"——多半是
   无缓存公式，提示 `--calc`——还是"有值但都是文本"，后者不要加 `--calc`）；
@@ -663,6 +674,28 @@ xlpeek read book.xlsx -s 明细 --header --dates iso -l 1000
 
 ---
 
+### 陷阱 11：你算的是文件，用户看的是屏幕
+
+Excel 里"筛选后的视图 / 折叠的分组 / 报表自己写的小计行"都和文件本身不一样。三条实测：
+
+- **隐藏行**（筛选后保存、折叠大纲、手动隐藏）：行还在文件里，Excel 里看不见。
+  `agg --sum 金额` 默认把它们算进去——数字对、口径不对——并在 `warnings` 里说明有几行、为什么隐藏。
+  要**屏幕上那个数**就加 `--visible-only`；不确定有没有先看 `info --deep` 的 `hidden_rows`。
+- **小计/合计行**：报表把 `小计`、`合计`、`总计`、`累计`、`其中` 写在自己的明细列里，
+  直接求和等于把同一笔钱算两遍（随包夹具实测 **1700**，而报表自己写的是 **700**）。
+  工具会点名第几行、是哪两个字；`--exclude-totals` 一键只要明细。
+- **两级表头**：标题行跨在列名之上时用 `--header-rows 2`；合并的标题只写在第一格，
+  要 `--fill-merged` 才会铺到合并区其余列。
+- **全角数字**（从 Word / 微信 粘进 Excel）：`１２３４`、`１，２３４` 现在按数字读（1.2.0 起），
+  以前会被静默跳过。
+- **报数字时带上指纹**：`file_size` / `file_mtime` 每个响应都有，要更强证据加 `--fingerprint` ——
+  一周后对账时能说清"这个数来自哪一版文件"。
+
+> 这四类都有随包夹具与断言：`testdata/office.xlsx` + `examples/regression/regress_office.py`，
+> 里面写的是数字本身（1600 vs 2100、700 vs 1700、2968 vs 500），不是描述。
+
+---
+
 ## 六、推荐工作流
 
 ### A. 探索一个陌生工作簿
@@ -749,16 +782,18 @@ TSV 模式第一行是 JSON 信封（含分页元数据），之后是表头行 
 
 ```bash
 xlpeek info    <f> [--deep] [-s 表] [--header-row N] [--sample N]
-xlpeek read    <f> [-s 表] [--header] [--header-row N] [-o N] [-l N]
+xlpeek read    <f> [-s 表] [--header] [--header-row N] [--header-rows N] [-o N] [-l N]
                       [--columns a,b|A:D] [--where expr] [--skip-empty]
-                      [--col "名=公式"] [--fill-merged] [--calc] [--raw]
+                      [--visible-only] [--exclude-totals] [--col "名=公式"]
+                      [--fill-merged] [--calc] [--raw] [--fingerprint]
                       [--dates iso|serial] [--format json|tsv|csv|markdown]
-xlpeek agg     <f> [-s 表] [--header] [--group-by a,b]
+xlpeek agg     <f> [-s 表] [--header] [--header-row N] [--header-rows N] [--group-by a,b]
                       [--sum e] [--avg e] [--min e] [--max e] [--count]
                       [--count-distinct c] [--col "名=公式"]
                       [--agg "名=公式"] [--share] [--derive "n=e"] [--where expr]
                       [--sort-by 字段] [--limit N] [--offset N]
-                      [--calc] [--fill-merged]
+                      [--visible-only] [--exclude-totals]
+                      [--calc] [--fill-merged] [--fingerprint]
 xlpeek profile <f> [-s 表] [--header] [--columns a,b|A:D] [--max-values N] [--where expr]
                       [--calc] [--fill-merged]
 xlpeek find    <f> [-s 表] -v 值 [--regex] [--ignore-case] [--column c]
@@ -767,7 +802,7 @@ xlpeek find    <f> [-s 表] -v 值 [--regex] [--ignore-case] [--column c]
 xlpeek serve       [--cache N] [--idle-timeout 5m]
 xlpeek ping
 
-通用：[-s 表名或序号] [--raw] [--password P] [--tmpdir D] [--pretty]
+通用：[-s 表名或序号] [--raw] [--password P] [--tmpdir D] [--pretty] [--fingerprint]
 
 约定值：read 的 --limit 默认 100、上限 5000；find 的 --limit 默认 50；
         agg 的 --limit 默认 1000（0 = 不限）；--max-columns 默认 128；
@@ -780,7 +815,8 @@ xlpeek ping
 必查字段：complete（是否完整）、warning_count（必须为 0 才能直接报数字）、
          warnings（> 0 时**逐条读**：同一列混用多种货币、有行落进空分组、
          引用的列没有任何可用数值、过滤值不是数字却被按文本比较、
-         公式在某些行/组算不出来（#VALUE!、VLOOKUP 查不到）——
+         公式在某些行/组算不出来（#VALUE!、VLOOKUP 查不到）、
+         有行是隐藏的（Excel 里看不到）、有行是报表自己的小计/合计——
          这几类都是"结果可能不是你要的"的信号，先按消息里的提示处理再下结论）、
          unaccounted_columns（汇总时是否有未计入的可疑维度列）、
          data_bytes / data_warning（响应多大，是否该收窄查询）

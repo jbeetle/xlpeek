@@ -36,6 +36,7 @@ REQUIRED_FIXTURES = [
     FIXTURES / "hs.xlsx",
     FIXTURES / "shapes.xlsx",
     FIXTURES / "round2.xlsx",
+    FIXTURES / "office.xlsx",
     REPO / "examples" / "regression" / "fixtures" / "header_row.xlsx",
 ]
 

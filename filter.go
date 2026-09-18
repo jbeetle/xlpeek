@@ -302,7 +302,7 @@ const currencySymbols = "\u00a5\uffe5\u0024\u20ac\u00a3\u20a9\u20b9"
 // to catch: the caller can see that a column mixed ¥ and $ even though both
 // parsed.
 func parseNumberUnit(s string) (float64, string, bool) {
-	text := strings.TrimSpace(s)
+	text := normalizeNumberText(strings.TrimSpace(s))
 	// Thousands separators, plus the spaces a locale or a number format pads with.
 	for _, separator := range []string{",", " ", "\u00a0", "\u3000"} {
 		text = strings.ReplaceAll(text, separator, "")
@@ -323,6 +323,57 @@ func parseNumberUnit(s string) (float64, string, bool) {
 		return 0, "", false
 	}
 	return value * scale, unit, true
+}
+
+// normalizeNumberText rewrites the full-width forms of digits and punctuation
+// as their ASCII equivalents.
+//
+// This is how a number looks after it has been through a word processor or a
+// chat client: "１２３４" and "１，２３４" are what a Chinese report holds when
+// someone pasted a figure in from Word or WeChat rather than typing it. Every
+// parser reads those as text, so every aggregate skipped them — the value was
+// there, the total was smaller, and only the skipped-cell count said so.
+//
+// Only characters that cannot change meaning are rewritten: digits, the comma,
+// the period, the percent sign and the two signs. A full stop in a sentence
+// stays a full stop because nothing else in a value is parsed as a number.
+func normalizeNumberText(s string) string {
+	rewrite := func(r rune) (rune, bool) {
+		switch {
+		case r >= '０' && r <= '９': // ０-９
+			return r - '０' + '0', true
+		case r == '，': // ，
+			return ',', true
+		case r == '．': // ．
+			return '.', true
+		case r == '％': // ％
+			return '%', true
+		case r == '－': // －
+			return '-', true
+		case r == '＋': // ＋
+			return '+', true
+		}
+		return r, false
+	}
+	found := false
+	for _, r := range s {
+		if _, ok := rewrite(r); ok {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return s // the common case: nothing to rewrite, no allocation
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if replaced, ok := rewrite(r); ok {
+			r = replaced
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 // trimCurrency removes at most one currency symbol from either end of text,

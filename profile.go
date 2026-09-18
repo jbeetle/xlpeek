@@ -54,15 +54,19 @@ type columnProfile struct {
 }
 
 type profileResult struct {
-	File         string          `json:"file"`
-	Sheet        string          `json:"sheet"`
-	SheetIndex   int             `json:"sheet_index"`
-	HeaderRow    int             `json:"header_row,omitempty"`
-	RowsScanned  int             `json:"rows_scanned"`
-	RowsMatched  int             `json:"rows_matched"`
-	Columns      []columnProfile `json:"columns"`
-	WarningCount int             `json:"warning_count"`
-	Warnings     []string        `json:"warnings,omitempty"`
+	File string `json:"file"`
+	fileStamp
+	Sheet         string          `json:"sheet"`
+	SheetIndex    int             `json:"sheet_index"`
+	HeaderRow     int             `json:"header_row,omitempty"`
+	HeaderRows    int             `json:"header_rows,omitempty"`
+	VisibleOnly   bool            `json:"visible_only,omitempty"`
+	ExcludeTotals bool            `json:"exclude_totals,omitempty"`
+	RowsScanned   int             `json:"rows_scanned"`
+	RowsMatched   int             `json:"rows_matched"`
+	Columns       []columnProfile `json:"columns"`
+	WarningCount  int             `json:"warning_count"`
+	Warnings      []string        `json:"warnings,omitempty"`
 }
 
 type columnAccumulator struct {
@@ -228,6 +232,11 @@ func cmdProfile(args []string) int {
 	fs.StringVar(&columns, "columns", "", "comma-separated columns to profile; default is all of them")
 	headerFlag := fs.Bool("header", false, "treat row 1 as the header, so columns are named")
 	headerRow := fs.Int("header-row", 0, "worksheet row holding the column names; overrides --header")
+	headerRows := fs.Int("header-rows", 1, "rows the header spans, for a two-level header; 1 unless a title row sits above the names")
+	visibleOnly := fs.Bool("visible-only", false,
+		"describe only the rows the sheet shows, skipping rows hidden by a filter or an outline")
+	excludeTotals := fs.Bool("exclude-totals", false,
+		"drop rows that look like the report's own subtotal or total lines before describing")
 	skipEmpty := fs.Bool("skip-empty", false, "ignore rows whose cells are all empty")
 	calc := fs.Bool("calc", false, "evaluate formulas that have no cached value; loads the sheet into memory")
 	fillMerged := fs.Bool("fill-merged", false, "copy each merged region's value into every cell it spans; loads the sheet into memory")
@@ -237,6 +246,8 @@ func cmdProfile(args []string) int {
 	raw := fs.Bool("raw", false, "profile stored values instead of number-formatted values")
 	tmpDir := fs.String("tmpdir", "", "directory for temporary files (default: system temp)")
 	pretty := fs.Bool("pretty", false, "indent the JSON output")
+	fingerprint := fs.Bool("fingerprint", false,
+		"add the file's SHA-256 to the response; reads the whole file")
 	var wheres stringSlice
 	fs.Var(&wheres, "where", "row filter applied before profiling; repeatable and ANDed")
 
@@ -296,9 +307,12 @@ func cmdProfile(args []string) int {
 	if *headerRow > 0 {
 		headerAt = *headerRow
 	}
+	if err := headerSpan(headerAt, *headerRows); err != nil {
+		return failUsage("profile", err.Error())
+	}
 	firstDataRow := 1
 	if headerAt > 0 {
-		firstDataRow = headerAt + 1
+		firstDataRow = headerAt + max(1, *headerRows)
 	}
 
 	var (
@@ -328,18 +342,29 @@ func cmdProfile(args []string) int {
 		}
 	}
 
-	var rowsScanned, rowsMatched int
+	var (
+		rowsScanned, rowsMatched int
+		visibility               = newRowVisibility(*visibleOnly)
+		summaryRows              subtotalCounters
+		headerRowsRead           [][]string
+	)
 	pos := 0
 	for iter.Next() {
 		pos++
 		if pos < firstDataRow {
-			if headerAt > 0 && pos == headerAt {
-				if header, err = iter.Columns(); err != nil {
+			if headerAt > 0 && pos >= headerAt {
+				var headerRow []string
+				if headerRow, err = iter.Columns(); err != nil {
 					return failWithSheet("profile", err, f.GetSheetList(), *pretty)
 				}
 				if merges != nil {
-					header = merges.apply(pos, header, *maxColumns)
+					headerRow = merges.apply(pos, headerRow, *maxColumns)
 				}
+				headerRowsRead = append(headerRowsRead, headerRow)
+				if pos < headerAt+max(1, *headerRows)-1 {
+					continue // another header row follows
+				}
+				header = mergeHeaderRows(headerRowsRead)
 				// Create a column for every named header, so that a column that
 				// is empty throughout is still reported as empty rather than
 				// vanishing from the profile.
@@ -380,13 +405,26 @@ func cmdProfile(args []string) int {
 			resolved = true
 		}
 		rowsScanned++
+		// What the sheet says about the row, before anything decides whether it
+		// counts: a hidden row and a subtotal line both distort a column's range
+		// and fill rate, which is what a profile is.
+		visibility.note(pos, iter.GetRowOpts())
+		summary := subtotalLabel(cells)
+		if *excludeTotals && summary != "" {
+			summaryRows.note(pos, summary, true)
+			continue
+		}
 		if len(filters) > 0 && !matchFilters(filters, cells, nil) {
 			continue
 		}
 		if *skipEmpty && !nonEmpty(cells) {
 			continue
 		}
+		if *visibleOnly && visibility.hiddenRow(pos) {
+			continue
+		}
 		rowsMatched++
+		summaryRows.note(pos, summary, false)
 		ensure(len(cells))
 		for i, accumulator := range accums {
 			accumulator.observe(valueAt(cells, i), &budget)
@@ -429,6 +467,16 @@ func cmdProfile(args []string) int {
 		RowsScanned: rowsScanned,
 		RowsMatched: rowsMatched,
 		Columns:     make([]columnProfile, 0, len(selected)),
+	}
+	stampFile(&result.fileStamp, path, *fingerprint)
+	result.HeaderRows = *headerRows
+	result.VisibleOnly = *visibleOnly
+	result.ExcludeTotals = *excludeTotals
+	if warning := visibilityNote(visibility, *visibleOnly, rowsScanned); warning != "" {
+		result.Warnings = append(result.Warnings, warning)
+	}
+	if warning := totalsNote(&summaryRows, *excludeTotals, rowsMatched); warning != "" {
+		result.Warnings = append(result.Warnings, warning)
 	}
 	capped := false
 	for _, accumulator := range selected {

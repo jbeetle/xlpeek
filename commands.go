@@ -8,7 +8,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 
@@ -53,8 +52,8 @@ func valueAt(row []string, idx int) string {
 // ---------------------------------------------------------------------------
 
 type infoResult struct {
-	File       string      `json:"file"`
-	FileSize   int64       `json:"file_size"`
+	File string `json:"file"`
+	fileStamp
 	SheetCount int         `json:"sheet_count"`
 	Sheets     []sheetInfo `json:"sheets"`
 }
@@ -80,10 +79,14 @@ type sheetInfo struct {
 	// the file's own hint and counts formatted empty rows, last_row is where
 	// the scan stopped, and populated_rows is a count rather than a position —
 	// so a caller wanting to plan paging had nothing to compute it from.
-	LastPopulatedRow int      `json:"last_populated_row,omitempty"`
-	MergedRanges     int      `json:"merged_ranges,omitempty"`
-	MergedSample     []string `json:"merged_sample,omitempty"`
-	ScanError        string   `json:"scan_error,omitempty"`
+	LastPopulatedRow int `json:"last_populated_row,omitempty"`
+	// HiddenRows is how many rows the sheet hides — a saved filter, a collapsed
+	// outline, a manual hide. Reported only by a deep scan, which is the only
+	// one that walks every row.
+	HiddenRows   int      `json:"hidden_rows,omitempty"`
+	MergedRanges int      `json:"merged_ranges,omitempty"`
+	MergedSample []string `json:"merged_sample,omitempty"`
+	ScanError    string   `json:"scan_error,omitempty"`
 }
 
 // cmdInfo summarises a workbook so a caller can decide which sheet to read and
@@ -94,6 +97,7 @@ func cmdInfo(args []string) int {
 	fs.StringVar(&sheet, "sheet", "", "restrict the report to one sheet")
 	fs.StringVar(&sheet, "s", "", "restrict the report to one sheet (shorthand)")
 	headerRow := fs.Int("header-row", 1, "worksheet row holding the column names; 0 means there is no header")
+	headerRows := fs.Int("header-rows", 1, "rows the header spans, for a two-level header; 1 unless a title row sits above the names")
 	sample := fs.Int("sample", 3, "data rows to preview after the header; 0 disables")
 	deep := fs.Bool("deep", false, "walk every row to report exact counts; slower on large files")
 	maxColumns := fs.Int("max-columns", defaultMaxColumns, "cap on the number of columns reported")
@@ -101,6 +105,8 @@ func cmdInfo(args []string) int {
 	raw := fs.Bool("raw", false, "report stored values instead of number-formatted values")
 	tmpDir := fs.String("tmpdir", "", "directory for temporary files (default: system temp)")
 	pretty := fs.Bool("pretty", false, "indent the JSON output")
+	fingerprint := fs.Bool("fingerprint", false,
+		"add the file's SHA-256 to the response; reads the whole file")
 
 	operands, code, ok := parseFlags(fs, args)
 	if !ok {
@@ -118,6 +124,9 @@ func cmdInfo(args []string) int {
 	if *headerRow < 0 {
 		return failUsage("info", "--header-row must not be negative")
 	}
+	if err := headerSpan(*headerRow, *headerRows); err != nil {
+		return failUsage("info", err.Error())
+	}
 
 	path := operands[0]
 	f, err := openWorkbook(path, workbookOptions{password: *password, raw: *raw, tmpDir: *tmpDir})
@@ -134,9 +143,7 @@ func cmdInfo(args []string) int {
 		SheetCount: len(f.GetSheetList()),
 		Sheets:     make([]sheetInfo, 0),
 	}
-	if stat, statErr := os.Stat(path); statErr == nil {
-		result.FileSize = stat.Size()
-	}
+	stampFile(&result.fileStamp, path, *fingerprint)
 
 	ids := f.GetSheetMap()
 	idByName := make(map[string]int, len(ids))
@@ -162,7 +169,7 @@ func cmdInfo(args []string) int {
 	for _, index := range targets {
 		name := all[index]
 		result.Sheets = append(result.Sheets, describeSheet(f, name, index, idByName[name],
-			*headerRow, *sample, *deep, *maxColumns))
+			*headerRow, *headerRows, *sample, *deep, *maxColumns))
 	}
 	return respondOK("info", result, *pretty)
 }
@@ -171,7 +178,7 @@ func cmdInfo(args []string) int {
 // the caller asked for a deep scan. A sheet that cannot be read as a
 // worksheet (a chartsheet, for example) records the failure and the remaining
 // sheets are still reported.
-func describeSheet(f *excelize.File, name string, index, id, headerRow, sampleRows int, deep bool, maxColumns int) sheetInfo {
+func describeSheet(f *excelize.File, name string, index, id, headerRow, headerRows, sampleRows int, deep bool, maxColumns int) sheetInfo {
 	info := sheetInfo{Index: index, ID: id, Name: name}
 
 	// Visibility is a pointer so that "could not be determined" stays distinct
@@ -185,7 +192,7 @@ func describeSheet(f *excelize.File, name string, index, id, headerRow, sampleRo
 		info.MaxRow, info.MaxColumn = parseDimension(dimension)
 	}
 
-	scan, err := scanSheet(f, name, headerRow, sampleRows, deep)
+	scan, err := scanSheet(f, name, headerRow, headerRows, sampleRows, deep)
 	if err != nil {
 		info.ScanError = err.Error()
 		return info
@@ -214,6 +221,9 @@ func describeSheet(f *excelize.File, name string, index, id, headerRow, sampleRo
 		info.LastRow = scan.lastRow
 		info.PopulatedRows = scan.populatedRows
 		info.LastPopulatedRow = scan.lastPopulatedRow
+		// A hidden row is invisible to the person reading the sheet, so a count
+		// of them belongs with the other facts a deep scan reports.
+		info.HiddenRows = scan.hiddenRows
 		// Merged regions are a correctness hazard for a reader that does not
 		// know about them, so a deep scan surfaces them. It is kept out of the
 		// shallow path because reading them parses the whole worksheet.
@@ -250,16 +260,22 @@ func parseDimension(ref string) (rows, cols int) {
 // ---------------------------------------------------------------------------
 
 type readResult struct {
-	File       string   `json:"file"`
-	Sheet      string   `json:"sheet"`
-	SheetIndex int      `json:"sheet_index"`
-	HeaderMode bool     `json:"header_mode"`
-	HeaderRow  int      `json:"header_row,omitempty"`
-	SkipEmpty  bool     `json:"skip_empty,omitempty"`
-	FillMerged bool     `json:"fill_merged,omitempty"`
-	Dates      string   `json:"dates,omitempty"`
-	Header     []string `json:"header,omitempty"`
-	Columns    []string `json:"columns"`
+	File string `json:"file"`
+	fileStamp
+	Sheet      string `json:"sheet"`
+	SheetIndex int    `json:"sheet_index"`
+	HeaderMode bool   `json:"header_mode"`
+	HeaderRow  int    `json:"header_row,omitempty"`
+	HeaderRows int    `json:"header_rows,omitempty"`
+	SkipEmpty  bool   `json:"skip_empty,omitempty"`
+	// VisibleOnly and ExcludeTotals say which rows were left out, so that a
+	// figure can be explained without re-running the command.
+	VisibleOnly   bool     `json:"visible_only,omitempty"`
+	ExcludeTotals bool     `json:"exclude_totals,omitempty"`
+	FillMerged    bool     `json:"fill_merged,omitempty"`
+	Dates         string   `json:"dates,omitempty"`
+	Header        []string `json:"header,omitempty"`
+	Columns       []string `json:"columns"`
 	// DerivedColumns names the --col columns, which follow the sheet's own
 	// columns in every row and in header_keys. Without it a caller reading a
 	// page would have to work out which trailing values came from a formula.
@@ -291,6 +307,9 @@ func cmdRead(args []string) int {
 	fs.StringVar(&columns, "columns", "", "comma-separated columns to project, by header name, letter or index")
 	header := fs.Bool("header", false, "treat row 1 as the header and return each row as an object")
 	headerRow := fs.Int("header-row", 0, "worksheet row holding the column names; overrides --header")
+	headerRows := fs.Int("header-rows", 1, "rows the header spans, for a two-level header; 1 unless a title row sits above the names")
+	visibleOnly := fs.Bool("visible-only", false, "read only the rows the sheet shows, skipping rows hidden by a filter or an outline")
+	excludeTotals := fs.Bool("exclude-totals", false, "drop rows that look like the report's own subtotal or total lines")
 	offset := fs.Int("offset", 0, "rows to skip; counts returned rows, so it always walks forward from the start")
 	fs.IntVar(offset, "o", 0, "rows to skip (shorthand)")
 	limit := fs.Int("limit", defaultLimit, "maximum rows to return")
@@ -305,6 +324,8 @@ func cmdRead(args []string) int {
 	raw := fs.Bool("raw", false, "return stored values instead of number-formatted values")
 	tmpDir := fs.String("tmpdir", "", "directory for temporary files (default: system temp)")
 	pretty := fs.Bool("pretty", false, "indent the JSON output")
+	fingerprint := fs.Bool("fingerprint", false,
+		"add the file's SHA-256 to the response; reads the whole file")
 	var wheres, colArgs stringSlice
 	fs.Var(&wheres, "where", "row filter, repeatable and ANDed, e.g. --where \"金额>1000\" or --where \"状态~完成\"")
 	fs.Var(&colArgs, "col", "column computed per row by an Excel formula, e.g. "+
@@ -357,6 +378,9 @@ func cmdRead(args []string) int {
 		return failUsage("read", "--col needs --header (or --header-row N): a derived column is "+
 			"referred to by name, and a sheet read without a header row has none")
 	}
+	if err := headerSpan(headerAt, *headerRows); err != nil {
+		return failUsage("read", err.Error())
+	}
 	filters, err := parseFilterList(wheres)
 	if err != nil {
 		return failUsage("read", err.Error())
@@ -375,18 +399,21 @@ func cmdRead(args []string) int {
 	}
 
 	res, err := readPage(f, pageRequest{
-		sheet:      sheetName,
-		sheetIndex: sheetIndex,
-		headerRow:  headerAt,
-		offset:     *offset,
-		limit:      *limit,
-		filters:    filters,
-		skipEmpty:  *skipEmpty,
-		calc:       *calc,
-		fillMerged: *fillMerged,
-		dates:      *dates,
-		maxColumns: *maxColumns,
-		colArgs:    colArgs,
+		sheet:         sheetName,
+		sheetIndex:    sheetIndex,
+		headerRow:     headerAt,
+		offset:        *offset,
+		limit:         *limit,
+		filters:       filters,
+		skipEmpty:     *skipEmpty,
+		calc:          *calc,
+		fillMerged:    *fillMerged,
+		dates:         *dates,
+		maxColumns:    *maxColumns,
+		headerRows:    *headerRows,
+		visibleOnly:   *visibleOnly,
+		excludeTotals: *excludeTotals,
+		colArgs:       colArgs,
 	})
 	if err != nil {
 		return failWithSheet("read", err, userSheets(f), *pretty)
@@ -422,6 +449,9 @@ func cmdRead(args []string) int {
 		HeaderMode:     headerAt > 0,
 		HeaderRow:      headerAt,
 		SkipEmpty:      *skipEmpty,
+		HeaderRows:     *headerRows,
+		VisibleOnly:    *visibleOnly,
+		ExcludeTotals:  *excludeTotals,
 		FillMerged:     *fillMerged,
 		Header:         res.header,
 		Columns:        outColumns,
@@ -438,6 +468,7 @@ func cmdRead(args []string) int {
 		Format:         *format,
 		Rows:           buildRows(projected, outNames, headerAt > 0),
 	}
+	stampFile(&result.fileStamp, path, *fingerprint)
 	if *dates != datesDisplay {
 		result.Dates = *dates
 	}
@@ -551,16 +582,24 @@ func buildRows(rows [][]string, names []string, headerMode bool) interface{} {
 // ---------------------------------------------------------------------------
 
 type findResult struct {
-	File       string   `json:"file"`
+	File string `json:"file"`
+	fileStamp
 	Sheet      string   `json:"sheet"`
 	SheetIndex int      `json:"sheet_index"`
 	Pattern    string   `json:"pattern"`
 	UseRegex   bool     `json:"regex"`
 	IgnoreCase bool     `json:"ignore_case"`
 	Header     []string `json:"header,omitempty"`
-	Dates      string   `json:"dates,omitempty"`
-	MatchCount int      `json:"match_count"`
-	Truncated  bool     `json:"truncated"`
+	HeaderRows int      `json:"header_rows,omitempty"`
+	// VisibleOnly says hidden rows were skipped, and warnings carry what the
+	// search noticed about the sheet — a match in a hidden row is a match the
+	// person looking at it cannot see.
+	VisibleOnly  bool     `json:"visible_only,omitempty"`
+	WarningCount int      `json:"warning_count"`
+	Warnings     []string `json:"warnings,omitempty"`
+	Dates        string   `json:"dates,omitempty"`
+	MatchCount   int      `json:"match_count"`
+	Truncated    bool     `json:"truncated"`
 	// TruncatedApprox qualifies a truncated result the lookahead could not
 	// settle: the scan gave up looking for the next match, so there may or may
 	// not be one. Without it, "truncated" would have to mean both.
@@ -602,6 +641,9 @@ func cmdFind(args []string) int {
 	fs.BoolVar(ignoreCase, "i", true, "match case-insensitively (shorthand)")
 	headerMode := fs.Bool("header", false, "treat row 1 as the header; searches rows below it and labels matches")
 	headerRowFlag := fs.Int("header-row", 0, "worksheet row holding the column names; overrides --header")
+	headerRows := fs.Int("header-rows", 1, "rows the header spans, for a two-level header; 1 unless a title row sits above the names")
+	visibleOnly := fs.Bool("visible-only", false,
+		"search only the rows the sheet shows, skipping rows hidden by a filter or an outline")
 	limit := fs.Int("limit", 50, "maximum matches to return")
 	fs.IntVar(limit, "l", 50, "maximum matches to return (shorthand)")
 	offset := fs.Int("offset", 0, "matches to skip; counts matches, so it always walks forward from the start")
@@ -613,6 +655,8 @@ func cmdFind(args []string) int {
 	raw := fs.Bool("raw", false, "search stored values instead of number-formatted values")
 	tmpDir := fs.String("tmpdir", "", "directory for temporary files (default: system temp)")
 	pretty := fs.Bool("pretty", false, "indent the JSON output")
+	fingerprint := fs.Bool("fingerprint", false,
+		"add the file's SHA-256 to the response; reads the whole file")
 
 	operands, code, ok := parseFlags(fs, args)
 	if !ok {
@@ -691,6 +735,7 @@ func cmdFind(args []string) int {
 		Offset:     *offset,
 		Matches:    make([]findMatch, 0, *limit),
 	}
+	stampFile(&result.fileStamp, path, *fingerprint)
 	if *dates != datesDisplay {
 		result.Dates = *dates
 	}
@@ -701,10 +746,16 @@ func cmdFind(args []string) int {
 	if *headerRowFlag > 0 {
 		headerAt = *headerRowFlag
 	}
+	if err := headerSpan(headerAt, *headerRows); err != nil {
+		return failUsage("find", err.Error())
+	}
+	result.HeaderRows = *headerRows
+	result.VisibleOnly = *visibleOnly
 	firstDataRow := 1
 	if headerAt > 0 {
-		firstDataRow = headerAt + 1
+		firstDataRow = headerAt + max(1, *headerRows)
 	}
+	visibility := newRowVisibility(*visibleOnly)
 	columnIndex := -1
 	if column != "" && headerAt == 0 {
 		if columnIndex, err = resolveColumn(column, nil); err != nil {
@@ -713,9 +764,10 @@ func cmdFind(args []string) int {
 	}
 
 	var (
-		pos     int
-		keys    []string
-		skipped int
+		pos            int
+		keys           []string
+		headerRowsRead [][]string
+		skipped        int
 		// probing is set once the page is full. The scan then continues, not to
 		// collect matches but to find out whether another one exists: stopping
 		// at the limit reported truncated either way, so the last page of a
@@ -759,10 +811,16 @@ scan:
 			}
 		}
 		if pos < firstDataRow {
-			if headerAt > 0 && pos == headerAt {
-				if result.Header, err = iter.Columns(); err != nil {
+			if headerAt > 0 && pos >= headerAt {
+				var headerRow []string
+				if headerRow, err = iter.Columns(); err != nil {
 					return failWithSheet("find", err, f.GetSheetList(), *pretty)
 				}
+				headerRowsRead = append(headerRowsRead, headerRow)
+				if pos < headerAt+max(1, *headerRows)-1 {
+					continue // another header row follows
+				}
+				result.Header = mergeHeaderRows(headerRowsRead)
 				if column != "" {
 					if columnIndex, err = resolveColumn(column, result.Header); err != nil {
 						return respondErr("find", codeColumnNotFound, err.Error(), *pretty, exitUsage)
@@ -792,6 +850,10 @@ scan:
 				result.Truncated = true
 			}
 			break
+		}
+		visibility.note(pos, iter.GetRowOpts())
+		if *visibleOnly && visibility.hiddenRow(pos) {
+			continue
 		}
 		result.RowsScanned++
 		// Pad the context row to at least the header width so that a match
@@ -879,5 +941,9 @@ scan:
 	}
 	result.MatchCount = len(result.Matches)
 	result.Complete = !result.Truncated
+	if warning := visibilityNote(visibility, *visibleOnly, result.RowsScanned); warning != "" {
+		result.Warnings = append(result.Warnings, warning)
+	}
+	result.WarningCount = len(result.Warnings)
 	return respondOK("find", result, *pretty)
 }

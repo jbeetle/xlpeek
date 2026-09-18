@@ -1492,3 +1492,99 @@ func TestScanFormulaReportsRiskyRangeCalls(t *testing.T) {
 		}
 	}
 }
+
+func TestParseNumberReadsFullWidthDigits(t *testing.T) {
+	// A figure pasted in from Word or WeChat keeps its full-width font. Every
+	// parser reads those as text, so the value was skipped and the total was
+	// quietly smaller.
+	cases := []struct {
+		cell string
+		want float64
+		ok   bool
+	}{
+		{"１２３４", 1234, true},
+		{"１，２３４.５", 1234.5, true},
+		{"１２．３４", 12.34, true},
+		{"－１００", -100, true},
+		{"５０％", 0.5, true},
+		{"¥１，２３４．５０", 1234.5, true},
+		// A full-width run that is not a number is still not a number.
+		{"１２３４元", 0, false},
+		// And ordinary text is untouched.
+		{"华东", 0, false},
+	}
+	for _, test := range cases {
+		got, _, ok := parseNumberUnit(test.cell)
+		if ok != test.ok || (ok && got != test.want) {
+			t.Errorf("parseNumberUnit(%q) = %v, %v; want %v, %v",
+				test.cell, got, ok, test.want, test.ok)
+		}
+	}
+}
+
+func TestSubtotalLabelReadsTheLabelNotTheData(t *testing.T) {
+	cases := []struct {
+		cells []string
+		want  string
+	}{
+		{[]string{"小计", "300"}, "小计"},
+		{[]string{"合计：华东", "300"}, "合计"},
+		{[]string{"总 计", "300"}, "总计"},
+		{[]string{"Subtotal", "300"}, "subtotal"},
+		{[]string{"", "其中", "300"}, "其中"},
+		// A column heading that merely starts with the word is not a total, and a
+		// remark that happens to say so is not the row's label.
+		{[]string{"合计额", "300"}, ""},
+		{[]string{"差旅费", "备注：合计"}, ""},
+		{[]string{"华东", "300"}, ""},
+		{[]string{}, ""},
+	}
+	for _, test := range cases {
+		if got := subtotalLabel(test.cells); got != test.want {
+			t.Errorf("subtotalLabel(%q) = %q, want %q", test.cells, got, test.want)
+		}
+	}
+}
+
+func TestMergeHeaderRowsJoinsWhatIsThere(t *testing.T) {
+	// The title is written only in the first cell of a merged region, so the
+	// column under it is named by the sub-header alone; --fill-merged is what
+	// spreads it. A part repeated on both rows is a cell merged vertically, and
+	// joining it twice would read "金额金额".
+	got := mergeHeaderRows([][]string{
+		{"", "2024年", "2024年"},
+		{"部门", "金额", "数量"},
+	})
+	want := []string{"部门", "2024年金额", "2024年数量"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Errorf("mergeHeaderRows = %q, want %q", got, want)
+	}
+}
+
+func TestMergeHeaderRowsDropsAVerticalRepeat(t *testing.T) {
+	// One cell merged down both header rows carries its text on each of them;
+	// joining it twice would read "金额金额" and name nothing.
+	if got := mergeHeaderRows([][]string{{"金额"}, {"金额"}}); got[0] != "金额" {
+		t.Errorf("mergeHeaderRows = %q, want 金额 once", got)
+	}
+}
+
+func TestHeaderSpanRejectsWhatItCannotDo(t *testing.T) {
+	for _, test := range []struct {
+		headerAt, rows int
+		wantErr        bool
+	}{
+		{1, 1, false},
+		{1, 3, false},
+		{3, 2, false},
+		{0, 1, false},
+		{0, 2, true}, // no header row to span from
+		{1, 0, true}, // a span of no rows
+	} {
+		err := headerSpan(test.headerAt, test.rows)
+		if (err != nil) != test.wantErr {
+			t.Errorf("headerSpan(%d, %d) = %v, want error: %v",
+				test.headerAt, test.rows, err, test.wantErr)
+		}
+	}
+}

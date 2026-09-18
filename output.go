@@ -8,12 +8,16 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/xuri/excelize/v2"
 )
@@ -146,6 +150,43 @@ func exitFor(err error) int {
 		return exitUsage
 	}
 	return exitError
+}
+
+// fileStamp identifies the file an answer came from.
+//
+// A figure that cannot be traced back to the version of the file that produced
+// it is hard to reconcile later: the workbook is edited, the number is checked
+// again, and the two no longer agree with no way to tell which moved. The size
+// and the modification time are free and travel with every response; the digest
+// is behind --fingerprint because it reads the whole file, and it is the one
+// that survives a copy, a rename or a checkout.
+type fileStamp struct {
+	FileSize   int64  `json:"file_size,omitempty"`
+	FileMTime  string `json:"file_mtime,omitempty"`
+	FileSHA256 string `json:"file_sha256,omitempty"`
+}
+
+// stampFile fills in the stamp for a path. The digest is only computed when the
+// caller asked for it; a failure to stat is not worth failing a command over,
+// so the fields are simply left empty.
+func stampFile(stamp *fileStamp, path string, fingerprint bool) {
+	if stat, err := os.Stat(path); err == nil {
+		stamp.FileSize = stat.Size()
+		stamp.FileMTime = stat.ModTime().Format(time.RFC3339)
+	}
+	if !fingerprint {
+		return
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer func() { _ = file.Close() }()
+	digest := sha256.New()
+	if _, err = io.Copy(digest, file); err != nil {
+		return
+	}
+	stamp.FileSHA256 = hex.EncodeToString(digest.Sum(nil))
 }
 
 // orderedRow marshals as a JSON object that preserves worksheet column order.

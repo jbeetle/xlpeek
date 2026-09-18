@@ -477,19 +477,25 @@ type deriveSpec struct {
 }
 
 type aggResult struct {
-	File        string       `json:"file"`
-	Sheet       string       `json:"sheet"`
-	SheetIndex  int          `json:"sheet_index"`
-	GroupBy     []string     `json:"group_by,omitempty"`
-	Fields      []string     `json:"fields"`
-	RowsScanned int          `json:"rows_scanned"`
-	RowsMatched int          `json:"rows_matched"`
-	GroupCount  int          `json:"group_count"`
-	Offset      int          `json:"offset,omitempty"`
-	Limit       int          `json:"limit,omitempty"`
-	HasMore     bool         `json:"has_more"`
-	NextOffset  *int         `json:"next_offset,omitempty"`
-	Rows        []orderedRow `json:"rows"`
+	File string `json:"file"`
+	fileStamp
+	Sheet      string   `json:"sheet"`
+	SheetIndex int      `json:"sheet_index"`
+	GroupBy    []string `json:"group_by,omitempty"`
+	HeaderRows int      `json:"header_rows,omitempty"`
+	// VisibleOnly and ExcludeTotals say which rows were left out, so a figure
+	// can be explained without re-running the command.
+	VisibleOnly   bool         `json:"visible_only,omitempty"`
+	ExcludeTotals bool         `json:"exclude_totals,omitempty"`
+	Fields        []string     `json:"fields"`
+	RowsScanned   int          `json:"rows_scanned"`
+	RowsMatched   int          `json:"rows_matched"`
+	GroupCount    int          `json:"group_count"`
+	Offset        int          `json:"offset,omitempty"`
+	Limit         int          `json:"limit,omitempty"`
+	HasMore       bool         `json:"has_more"`
+	NextOffset    *int         `json:"next_offset,omitempty"`
+	Rows          []orderedRow `json:"rows"`
 	// UnaccountedColumns lists the columns that take no part in the grouping or
 	// the aggregates yet vary across the aggregated rows. They are the reason a
 	// total can be arithmetically right and semantically meaningless.
@@ -513,7 +519,12 @@ func cmdAgg(args []string) int {
 	fs.StringVar(&sortBy, "sort-by", "", "output field to sort by; anything not a group key sorts descending")
 	headerFlag := fs.Bool("header", false, "treat row 1 as the header, so columns can be referred to by name")
 	headerRow := fs.Int("header-row", 0, "worksheet row holding the column names; overrides --header")
+	headerRows := fs.Int("header-rows", 1, "rows the header spans, for a two-level header; 1 unless a title row sits above the names")
 	skipEmpty := fs.Bool("skip-empty", false, "drop rows whose cells are all empty")
+	visibleOnly := fs.Bool("visible-only", false,
+		"aggregate only the rows the sheet shows, skipping rows hidden by a filter or an outline")
+	excludeTotals := fs.Bool("exclude-totals", false,
+		"drop rows that look like the report's own subtotal or total lines before aggregating")
 	calc := fs.Bool("calc", false, "evaluate formulas that have no cached value; loads the sheet into memory")
 	fillMerged := fs.Bool("fill-merged", false, "copy each merged region's value into every cell it spans; loads the sheet into memory")
 	offset := fs.Int("offset", 0, "output groups to skip")
@@ -524,6 +535,8 @@ func cmdAgg(args []string) int {
 	raw := fs.Bool("raw", false, "aggregate stored values instead of number-formatted values")
 	tmpDir := fs.String("tmpdir", "", "directory for temporary files (default: system temp)")
 	pretty := fs.Bool("pretty", false, "indent the JSON output")
+	fingerprint := fs.Bool("fingerprint", false,
+		"add the file's SHA-256 to the response; reads the whole file")
 	count := fs.Bool("count", false, "include the number of matched rows per group")
 	share := fs.Bool("share", false, "add share_<field> percentages of the total for each summed field")
 	var sums, avgs, mins, maxs, distincts, deriveArgs, wheres stringSlice
@@ -771,7 +784,7 @@ func cmdAgg(args []string) int {
 	}
 	firstDataRow := 1
 	if headerAt > 0 {
-		firstDataRow = headerAt + 1
+		firstDataRow = headerAt + max(1, *headerRows)
 	}
 	groupNames := splitList(groupBy)
 
@@ -782,6 +795,9 @@ func cmdAgg(args []string) int {
 	if len(colArgs) > 0 && headerAt == 0 {
 		return failUsage("agg", "--col needs --header (or --header-row N): a derived column is "+
 			"referred to by name, and a sheet read without a header row has none")
+	}
+	if err := headerSpan(headerAt, *headerRows); err != nil {
+		return failUsage("agg", err.Error())
 	}
 
 	var (
@@ -944,18 +960,27 @@ func cmdAgg(args []string) int {
 
 	var (
 		rowsScanned, rowsMatched, nonNumeric int
+		visibility                           = newRowVisibility(*visibleOnly)
+		summaryRows                          subtotalCounters
+		headerRowsRead                       [][]string
 	)
 	pos := 0
 	for iter.Next() {
 		pos++
 		if pos < firstDataRow {
-			if headerAt > 0 && pos == headerAt {
-				if header, err = iter.Columns(); err != nil {
+			if headerAt > 0 && pos >= headerAt {
+				var headerRow []string
+				if headerRow, err = iter.Columns(); err != nil {
 					return failWithSheet("agg", err, userSheets(f), *pretty)
 				}
 				if merges != nil {
-					header = merges.apply(pos, header, defaultMaxColumns)
+					headerRow = merges.apply(pos, headerRow, defaultMaxColumns)
 				}
+				headerRowsRead = append(headerRowsRead, headerRow)
+				if pos < headerAt+max(1, *headerRows)-1 {
+					continue // another header row follows
+				}
+				header = mergeHeaderRows(headerRowsRead)
 				if err = resolve(); err != nil {
 					return fail("agg", err, *pretty)
 				}
@@ -990,7 +1015,18 @@ func cmdAgg(args []string) int {
 			}
 		}
 		rowsScanned++
+		// What the sheet itself says about the row: whether it is hidden, and
+		// whether it reads like the report's own subtotal line.
+		visibility.note(pos, iter.GetRowOpts())
+		summary := subtotalLabel(cells)
+		if *excludeTotals && summary != "" {
+			summaryRows.note(pos, summary, true)
+			continue
+		}
 		if *skipEmpty && !nonEmpty(cells) {
+			continue
+		}
+		if *visibleOnly && visibility.hiddenRow(pos) {
 			continue
 		}
 		// The derived columns are computed before anything reads the row, so
@@ -1007,6 +1043,7 @@ func cmdAgg(args []string) int {
 			continue
 		}
 		rowsMatched++
+		summaryRows.note(pos, summary, false)
 
 		// Watch the columns that shape what the aggregates mean without taking
 		// part in them. This is what catches a total that quietly added 元 to
@@ -1257,18 +1294,22 @@ func cmdAgg(args []string) int {
 	}
 	out = out[start:]
 	result := &aggResult{
-		File:        path,
-		Sheet:       sheetName,
-		SheetIndex:  sheetIndex,
-		GroupBy:     groupNames,
-		Fields:      fieldNames,
-		RowsScanned: rowsScanned,
-		RowsMatched: rowsMatched,
-		GroupCount:  total,
-		Offset:      *offset,
-		Limit:       *limit,
-		Rows:        out,
+		File:          path,
+		Sheet:         sheetName,
+		SheetIndex:    sheetIndex,
+		GroupBy:       groupNames,
+		Fields:        fieldNames,
+		RowsScanned:   rowsScanned,
+		RowsMatched:   rowsMatched,
+		GroupCount:    total,
+		Offset:        *offset,
+		Limit:         *limit,
+		HeaderRows:    *headerRows,
+		VisibleOnly:   *visibleOnly,
+		ExcludeTotals: *excludeTotals,
+		Rows:          out,
 	}
+	stampFile(&result.fileStamp, path, *fingerprint)
 	if *limit > 0 && len(out) > *limit {
 		out = out[:*limit]
 		result.Rows = out
@@ -1291,6 +1332,12 @@ func cmdAgg(args []string) int {
 		}
 	}
 	if warning := blankGroupWarning(groups, order, groupNames, *fillMerged); warning != "" {
+		result.Warnings = append(result.Warnings, warning)
+	}
+	if warning := visibilityNote(visibility, *visibleOnly, rowsScanned); warning != "" {
+		result.Warnings = append(result.Warnings, warning)
+	}
+	if warning := totalsNote(&summaryRows, *excludeTotals, rowsMatched); warning != "" {
 		result.Warnings = append(result.Warnings, warning)
 	}
 	result.Warnings = append(result.Warnings, filterWarnings(filters)...)

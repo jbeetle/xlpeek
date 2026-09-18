@@ -30,6 +30,11 @@ except ImportError:  # pragma: no cover - a readable failure beats a traceback
 
 REPO = Path(__file__).resolve().parents[2]
 TARGET = REPO / "testdata" / "round2.xlsx"
+# The second fixture is a shape rather than a dataset: four sheets, each holding
+# one habit of a real office workbook that used to change an answer without
+# saying so. It is written by the same script because both files have to be
+# re-derivable when the shape they encode is questioned.
+OFFICE = REPO / "testdata" / "office.xlsx"
 
 
 def sheet_filters(wb):
@@ -145,6 +150,78 @@ def sheet_high_cardinality(wb):
         ws.append(["V%04d" % i, i])
 
 
+def office_hidden_rows(wb):
+    """隐藏行: a sheet saved from a filtered or collapsed view.
+
+    The rows a filter removed are still in the file — hidden, which is how Excel
+    writes a filtered row. The total on screen is 1600; the total over the file
+    is 2100, and until 1.2.0 nothing said which one was being answered. B is
+    hidden by hand and C by an outline group, so the two reasons are told apart.
+    """
+    ws = wb.create_sheet("隐藏行")
+    ws.append(["项目", "金额"])
+    for name, amount in (("A", 100), ("B", 200), ("C", 300),
+                         ("D", 400), ("E", 500), ("F", 600)):
+        ws.append([name, amount])
+    ws.row_dimensions[3].hidden = True            # B, hidden by hand
+    ws.row_dimensions[4].hidden = True            # C, collapsed under an outline
+    ws.row_dimensions[4].outlineLevel = 1
+    ws.auto_filter.ref = "A1:B7"                  # the filter this view was saved from
+
+
+def office_subtotals(wb):
+    """小计行: a report that writes its own totals into the detail column.
+
+    差旅费 100 + 办公费 200 = 小计 300, + 会议费 400 = 合计 700. Summing every
+    row gives 1700 — the subtotals counted twice and then counted again — while
+    the answer the report itself states is 700.
+    """
+    ws = wb.create_sheet("小计行")
+    ws.append(["科目", "金额"])
+    for subject, amount in (("差旅费", 100), ("办公费", 200), ("小计", 300),
+                            ("会议费", 400), ("合计", 700)):
+        ws.append([subject, amount])
+
+
+def office_two_level_header(wb):
+    """两级表头: a title row merged over the columns it groups.
+
+    The title sits only in the first cell of the merge, which is how Excel
+    stores one — so the first column under it is named 2024年金额 by the join,
+    and the second needs --fill-merged before it can be named at all. Both
+    facts are asserted, because both are what a caller will meet.
+    """
+    ws = wb.create_sheet("两级表头")
+    ws.append(["", "2024年", ""])
+    ws.append(["部门", "金额", "数量"])
+    for department, amount, count in (("甲", 100, 1), ("乙", 200, 2)):
+        ws.append([department, amount, count])
+    ws.merge_cells("B1:C1")
+
+
+def office_full_width(wb):
+    """全角数字: what a figure looks like after Word or WeChat.
+
+    Every row is a number to the person reading the sheet; two of the three used
+    to be text to every parser, so the column totalled 500 instead of 2968.
+    """
+    ws = wb.create_sheet("全角数字")
+    ws.append(["项目", "金额"])
+    for name, amount in (("甲", "１２３４"), ("乙", "１，２３４"), ("丙", 500)):
+        ws.append([name, amount])
+
+
+def build_office():
+    wb = Workbook()
+    wb.remove(wb.active)
+    for sheet in (office_hidden_rows, office_subtotals,
+                  office_two_level_header, office_full_width):
+        sheet(wb)
+    OFFICE.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(str(OFFICE))
+    print("wrote %s (%d bytes)" % (OFFICE.relative_to(REPO), OFFICE.stat().st_size))
+
+
 def build():
     wb = Workbook()
     wb.remove(wb.active)  # the default sheet has no part in the fixture
@@ -155,6 +232,7 @@ def build():
     TARGET.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(TARGET))
     print("wrote %s (%d bytes)" % (TARGET.relative_to(REPO), TARGET.stat().st_size))
+    build_office()
 
 
 if __name__ == "__main__":
