@@ -4,7 +4,7 @@
 （XLSX / XLSM / XLTM / XLTX / XLAM）。
 它是**只读**的：只能读，不能写、不能改格式、不能生成图表。
 
-> **本文档是权威版本。** 若需要一份只有约 500 token 的精简版常驻系统提示词，
+> **本文档是权威版本。** 若需要一份只有约 1000 token 的精简版常驻系统提示词，
 > 见 [SYSTEM_PROMPT.md](SYSTEM_PROMPT.md) —— 那是本文的压缩副本，细节以本文为准。
 
 ---
@@ -13,6 +13,8 @@
 
 1. **永远先跑 `info`。** 不要猜 sheet 名，不要假设表头在第 1 行。
 2. **汇总用 `agg`，不要自己翻页加总。** 把 2700 行拉进上下文只为了算一个数，是最大的浪费。
+   常见问法都有对应写法：**占比**用 `--share`，**中位数/分位数/条件计数**用 `--agg`，
+   **按月/按季看趋势、按单位币种折算**用 `--col`（详见 `agg` 一节）。
 3. **不熟悉的数据，先 `profile` 再 `agg`。** 有些列的值根本不可比（见第五节），不先查会得出错误结论而不自知。
 4. **页大小用 500–5000。** 小页的开销主要花在进程启动上，29 次小请求比 1 次大请求慢 15 倍。
 5. **每次调用只输出一个 JSON 信封到 stdout**，退出码 `0` 成功 / `1` 运行时错误 / `2` 用法错误。
@@ -26,8 +28,8 @@
 每次调用往 stdout 写且只写一个 JSON：
 
 ```json
-{"ok":true,"command":"read","version":"1.0.3","data":{ ... }}
-{"ok":false,"command":"read","version":"1.0.3","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
+{"ok":true,"command":"read","version":"1.1.0","data":{ ... }}
+{"ok":false,"command":"read","version":"1.1.0","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
 ```
 
 - **错误也在 stdout**，所以只有一个解析路径。先看 `ok`。
@@ -131,7 +133,12 @@ xlpeek read book.xlsx -s 明细 --header --fill-merged   # 合并单元格填值
 xlpeek read book.xlsx -s 明细 --header --format tsv -l 1000   # 最省 token
 xlpeek read book.xlsx -s 明细 --header --dates iso -l 1000    # 日期形态固定
 xlpeek read book.xlsx -s 明细 --header --columns "A:D"        # 列区间
+xlpeek read book.xlsx -s 明细 --header --col "月=MONTH(过账日期)" --columns "凭证号,月"
+xlpeek read book.xlsx -s 明细 --header --col "月=MONTH(过账日期)" --where "月=3"
 ```
+
+`--col "名字=公式"` 是逐行计算的派生列（详见下面 `agg` 一节的「公式」），
+它排在原表各列之后，列名进入 `header` 与 `derived_columns`，可以被 `--where` `--columns` 引用。
 
 分页元数据是自驱动的：
 
@@ -187,6 +194,7 @@ xlpeek agg book.xlsx -s 明细 --header --sum 收入金额 --calc
 
 聚合函数：`--sum` `--avg` `--min` `--max` `--count` `--count-distinct`，
 每个都可用多次，都接受算术表达式（`+ - * /` 和括号），都可以用 `名字=表达式` 重命名。
+此外还有 `--agg`（任意 Excel 公式，见下）与 `--share`（占比，见下）。
 
 > **列名本身含运算符、括号或空格时，写成方括号**：`--sum "[金额(万元)]"`。
 > 中文报表里 `金额(万元)`、`收入(USD)` 这类列名很常见，不加方括号会被当成算术式而报错
@@ -228,6 +236,99 @@ xlpeek agg book.xlsx -s 明细 --header --sum "[金额(万元)]" --sum "[成本(
   无缓存公式，提示 `--calc`——还是"有值但都是文本"，后者不要加 `--calc`）；
   同一列**混用了多种货币**（每个单元格都能解析，总和依然没有意义）；
   有行**分组键为空**（多半是合并标签列，消息里会提示 `--fill-merged`）。
+
+#### 公式：`--col`（逐行派生列）与 `--agg`（分组公式）
+
+工作簿自带的公式引擎可以直接用——`--calc` 求的是"没有缓存值的公式单元格"，
+`--col` 和 `--agg` 求的是**你写的公式**。公式按电子表格的写法写，列名直接写中文列名，
+不用换算成 `$J2601`：
+
+```bash
+# 时间趋势：从日期列派生月份，再按月份分组
+xlpeek agg book.xlsx -s 明细 --header --col "月=MONTH(过账日期)" --group-by 月 --sum 收入金额
+
+# 季度（QUARTER 不在引擎的函数清单里，用等价写法）
+xlpeek agg book.xlsx -s 明细 --header --col "季度=ROUNDUP(MONTH(过账日期)/3,0)" --group-by 季度 --sum 收入金额
+
+# 条件换算：混用单位/币种时先折算再汇总
+xlpeek agg book.xlsx -s 明细 --header \
+    --col "金额CNY=收入金额*IF(单位=\"千元\",1000,1)*IF(币种=\"USD\",7.2043,1)" \
+    --group-by 结算方式 --sum 金额CNY --count
+
+# 跨表取值：VLOOKUP 直接写，不需要另学一套语法（查找范围写小，见下）
+xlpeek agg book.xlsx -s 明细 --header \
+    --col "目标值=VLOOKUP(客户编号,目标表!$A$1:$B$100,2,FALSE)" --group-by 客户编号 --sum 收入金额
+
+# 文本清洗后再分组
+xlpeek agg book.xlsx -s 明细 --header --col "干净备注=TRIM(SUBSTITUTE(备注,\" \",\"\"))" --group-by 干净备注 --count
+
+# 分组公式：中位数 / 分位数 / 标准差 / 条件计数
+xlpeek agg book.xlsx -s 明细 --header --group-by 分部 \
+    --agg "中位金额=MEDIAN(收入金额)" --agg "p90=PERCENTILE(收入金额,0.9)" \
+    --agg "超标单数=COUNTIFS(收入金额,\">100000\",销售区域,\"华东\")" \
+    --agg "离散系数=STDEV(收入金额)/AVERAGE(收入金额)"
+
+# read 上同样可用，并且能被 --where / --columns 引用
+xlpeek read book.xlsx -s 明细 --header --col "月=MONTH(过账日期)" --where "月=3" --columns "凭证号,月"
+```
+
+- **`--col "名字=公式"`**（`agg` 与 `read` 都有，可重复）逐行算一列。算出来的列就是普通列：
+  `--group-by` `--where` `--sort-by` `--sum` `--agg` 都能引用它，后面的 `--col` 也能引用前面的。
+  在 `read` 里它排在原表各列之后，出现在 `header` 和 `derived_columns` 里，可以用 `--columns` 投影。
+- **`--agg "名字=公式"`**（`agg`，可重复）对**每个分组的所有行**算一个值。它与 `--sum` 等并存
+  （简写只是常用情形），`--derive` 照常作用于它的结果。
+- **`--col` 必须要有表头行**（`--header` 或 `--header-row N`）：派生列靠名字引用，没有表头行就没有名字。
+  派生列也不能与已有列重名、不能叫列字母（`B`）、序号（`2`）或单元格引用（`A1`）
+  ——否则后面的引用会有歧义，而歧义是静默的。
+- **公式看到的是文件里存的值**，不是 `--raw` / `--dates` 渲染出来的样子。所以：
+  - **存成文本的日期可以直接算**：`MONTH(过账日期)` 对 `"2023-05-02"` 这样的文本单元格有效
+    （引擎会自动转换），而不是日期的文本（如客户名称）会得到 `#VALUE!`，**不是静默的 0**；
+  - `¥1,234.50` / `12.35%` 这类**格式**在公式里不被识别——`--raw`/`--sum` 会去掉货币符号、
+    把百分比折算成小数，但公式拿到的是单元格里存的东西。要对这类列做运算，先用 `--sum`/`--col` 的算术表达式。
+- **跨表引用原样透传**：`目标表!$A:$B` 不会被改写，所以 `VLOOKUP`/`XLOOKUP`/`INDEX+MATCH` 都能直接用。
+  引用不存在的 sheet 会报 `USAGE` 并列出可用的 sheet。
+  但**查找范围一定要写小**：一次求值的代价是"被求值的行数 × 范围里的行数"，
+  `VLOOKUP(x,目标表!$A:$B,2,FALSE)` 等于每一行都把整列重扫一遍——2700 行实测 **44 秒**；
+  同样的查找写成 `$A$1:$B$100` 是 **0.8 秒**。整列引用在 Excel 里是常规写法，在这里是二次方的代价。
+  公式里出现整列引用时，`warnings` 会主动说明——44 秒的命令不告警就只是"看起来卡住了"。
+- **易变函数被拒绝**：`NOW` `TODAY` `RAND` `RANDBETWEEN` 引擎会**静默求值**，同一条命令两次跑出不同数字
+  ——对取数与核对来说比不支持更糟。命令里出现它们会直接报 `USAGE` 并点名函数。
+- **引擎不支持的函数会一次性报出来**：`QUARTER` 是办公报表常遇到、而引擎没有实现的一个
+  （等价写法 `ROUNDUP(MONTH(d)/3,0)`）；列名写错、引用不存在的 sheet、公式语法错误都在**开始扫描之前**
+  报错（退出码 2），而不是每行报一次。
+- **整列为空时会被点名，不会静默给 0**：程序生成的表（openpyxl/pandas/xlsxwriter）公式列没有缓存值，
+  读出来是空的，而引擎对"空的 SUM"给 **0**——那是个数字，而且是错的。`--agg` 读的列若在所有匹配行里
+  都没值，会明确说明并提示 `--calc`（与 `--sum` 同一套提示）；加了 `--calc` 就能算出真实结果。
+  而 `--col` 不需要 `--calc`：它通过引擎读，引擎会自己求值它引用的公式单元格。
+- **算不出来的行是数据，不是空值**：`#DIV/0!`、`#VALUE!`、`#NUM!`、`VLOOKUP no result found`
+  会**原样作为该单元格的值**（"空单元格"和"查不到"是两回事），并在 `warnings` 里按列计数；
+  `--agg` 算不出来的分组给 `null`，并说明是几分之几组。
+- 求值本身有成本：大约 **0.3–0.5 毫秒/行**。2600 行的 `--col` 实测约 0.7 秒（不派生约 0.15 秒）；
+  `--agg` 不论分组是 65 组还是 2600 组都在 0.7 秒左右，因为所有分组都会被求值再分页。
+  **两者都会像 `--calc` 一样放弃流式**（引擎要把工作表放进内存），`--agg` 还要为它读到的每一列
+  暂存各组的行值——大表上这是实打实的内存开销，只在这类问题确实需要时才加。
+- **不会改动工作簿**：公式和分组取的值写在临时工作表上，用到时才建、命令返回前删除（失败路径也删），
+  并且不会出现在任何 sheet 列表里。
+
+#### 占比：`--share`
+
+```bash
+xlpeek agg book.xlsx -s 明细 --header --group-by 结算方式 --sum 收入金额 --count --share
+```
+
+每一组给出 `share_<字段>`（可加的字段：`--sum` 与 `count`），是**小数不是百分数**，
+所以各组的 `share_count` 相加正好是 1，可以直接拿来核对。
+
+**总计与分组来自同一次扫描**，不是第二次查询——中间文件被改不会造成分子分母口径不一致；
+有 `--where` 时，分母也是过滤后的总计。同样的数字在 `--derive` 里写作 `_total_<字段>`：
+
+```bash
+xlpeek agg book.xlsx -s 明细 --header --group-by 结算方式 --sum 收入金额 \
+    --derive "占比=sum_收入金额/_total_sum_收入金额"
+```
+
+只有可加的字段有占比：`--avg` `--min` `--max` `--count-distinct` `--agg` 都不是整体的一部分，
+只给这些字段却要 `--share` 会直接报 `USAGE`；总计为 0 时给 `null` 并说明，不会除以 0。
 
 **⚠️ `unaccounted_columns` —— 务必检查这个字段。**
 
@@ -315,6 +416,11 @@ xlpeek profile book.xlsx -s 明细 --header --fill-merged   # 合并标签列不
 > 存储值外面的一层装饰，不是另一种数据。但**带公式却没有缓存值的列**（openpyxl / pandas /
 > xlsxwriter 生成的表就是这样）默认会显示成 `empty`，加 `--calc` 才能正确归类；
 > **合并标签列**的填充率默认是失真的，加 `--fill-merged` 才是真实覆盖率。
+
+> **`type` 说的是"能怎么用"，不是"怎么存的"。** 报 `date` 表示这些值可以当日用
+> ——可以比较、排序，也可以通过 `--col` 交给 `MONTH` 之类的函数；**存成文本的日期列同样报 `date`**，
+> 因为它确实能当日用。但它不表示单元格里存的是日期序列号：同一列加 `--raw` 拿到的是
+> `"2023-05-02"` 这样的字符串。要确认存储形态，看 `--raw`，不要看 `profile`。
 
 `top_values` 不存在时，看 `values_omitted` 区分原因，**不要假定"没列出 = 没有值"**：
 
@@ -534,6 +640,22 @@ xlpeek read book.xlsx -s 明细 --header --dates iso -l 1000
 `--dates serial` 给存储的数字。默认 `display` 保持文件原样——因为判断"哪些单元格是日期"
 必须读数字格式，那会载入整张表，所以和 `--calc` 一样是显式 opt-in。
 
+### 陷阱 10：公式算不出来的行，看着像"这列是空的"
+
+`--col` / `--agg` 的公式在某一行为什么算不出来，是有区别的，而且这个区别很重要：
+
+- **公式本身不成立**（函数不存在、列名写错、sheet 引用错、语法错）——整条命令直接报 `USAGE`（退出码 2），
+  不会扫完整张表才告诉你；
+- **这一行的数据算不出来**（`#DIV/0!`、`#VALUE!`、`#NUM!`、`VLOOKUP no result found`）——
+  引擎的报错原文会**原样成为该单元格的值**，并且计入 `warnings`。
+
+所以：看到某列出现 `#VALUE!`、`#DIV/0!`、`VLOOKUP no result found` 这样的取值，
+说明这行不是"没有数据"，而是"这条公式对它不适用"——空单元格和查不到是两回事，
+工具刻意不把它们混为一谈。**`warning_count > 0` 时同样不要直接把这列的数字报给用户。**
+
+分组公式（`--agg`）算不出来的组给 `null`，warnings 里会说明是"几分之几组"，
+点开看是哪一组再决定要不要处理。
+
 ---
 
 ## 六、推荐工作流
@@ -605,8 +727,11 @@ TSV 模式第一行是 JSON 信封（含分页元数据），之后是表头行 
 
 ## 八、限制：什么时候该告诉用户你做不到
 
-- **写操作**：改单元格、改格式、生成图表、做数据透视表 —— 全部不支持。
-- **公式依赖分析**：`--calc` 只能求值，不能告诉你公式引用了哪些单元格。
+- **写操作**：改单元格、改格式、写入公式、生成图表、做数据透视表 —— 全部不支持。
+  工作簿里**已有的**公式可以求值（`--calc`、`--col`、`--agg`），但工具不会往里写任何东西。
+- **公式依赖分析**：只能求值，不能告诉你某个公式引用了哪些单元格。
+- **交叉表/透视表形态**：`--group-by a,b` 给的是长格式（一行一个维度组合），这是刻意的
+  ——调用方要的是固定 schema，矩阵形态由渲染层自己转置。
 - **超大文件的精确统计**：`--deep` 和 `profile` 都要扫全表。行数极大时会明显变慢。
 - **加密文件**：报 `PASSWORD_REQUIRED` 时说明文件有密码，**只有用户能给你**——向用户索要，
   不要试图绕过，也不要反复重试。拿到后加 `--password` 重试。
@@ -621,11 +746,12 @@ TSV 模式第一行是 JSON 信封（含分页元数据），之后是表头行 
 xlpeek info    <f> [--deep] [-s 表] [--header-row N] [--sample N]
 xlpeek read    <f> [-s 表] [--header] [--header-row N] [-o N] [-l N]
                       [--columns a,b|A:D] [--where expr] [--skip-empty]
-                      [--fill-merged] [--calc] [--raw] [--dates iso|serial]
-                      [--format json|tsv|csv|markdown]
+                      [--col "名=公式"] [--fill-merged] [--calc] [--raw]
+                      [--dates iso|serial] [--format json|tsv|csv|markdown]
 xlpeek agg     <f> [-s 表] [--header] [--group-by a,b]
                       [--sum e] [--avg e] [--min e] [--max e] [--count]
-                      [--count-distinct c] [--derive "n=e"] [--where expr]
+                      [--count-distinct c] [--col "名=公式"]
+                      [--agg "名=公式"] [--share] [--derive "n=e"] [--where expr]
                       [--sort-by 字段] [--limit N] [--offset N]
                       [--calc] [--fill-merged]
 xlpeek profile <f> [-s 表] [--header] [--columns a,b|A:D] [--max-values N] [--where expr]
@@ -648,8 +774,9 @@ xlpeek ping
 
 必查字段：complete（是否完整）、warning_count（必须为 0 才能直接报数字）、
          warnings（> 0 时**逐条读**：同一列混用多种货币、有行落进空分组、
-         引用的列没有任何可用数值、过滤值不是数字却被按文本比较——
-         这四类都是"结果可能不是你要的"的信号，先按消息里的提示处理再下结论）、
+         引用的列没有任何可用数值、过滤值不是数字却被按文本比较、
+         公式在某些行/组算不出来（#VALUE!、VLOOKUP 查不到）——
+         这几类都是"结果可能不是你要的"的信号，先按消息里的提示处理再下结论）、
          unaccounted_columns（汇总时是否有未计入的可疑维度列）、
          data_bytes / data_warning（响应多大，是否该收窄查询）
 ```

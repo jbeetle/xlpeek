@@ -25,7 +25,7 @@ import (
 
 const (
 	tool    = "xlpeek"
-	version = "1.0.3"
+	version = "1.1.0"
 	// Copyright holder, reported by the version command and carried as the
 	// header of every source file in this command.
 	author    = "henryyu@163.com"

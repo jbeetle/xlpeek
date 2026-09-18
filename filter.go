@@ -161,10 +161,11 @@ func parseFilterList(exprs []string) ([]*filter, error) {
 
 // resolveFilters binds each filter to a column index. Header names are only
 // available in header mode; otherwise a filter must name a column letter or a
-// 1-based index.
-func resolveFilters(filters []*filter, header []string) error {
+// 1-based index. A --col column can be filtered on too, where it is measured
+// after it has been computed and before anything else reads the row.
+func resolveFilters(filters []*filter, header []string, derived *derivedSet) error {
 	for _, flt := range filters {
-		idx, err := resolveColumn(flt.col, header)
+		idx, err := resolveRowColumn(flt.col, header, derived)
 		if err != nil {
 			return fmt.Errorf("filter %q: %w", flt.raw, err)
 		}
@@ -173,14 +174,11 @@ func resolveFilters(filters []*filter, header []string) error {
 	return nil
 }
 
-// matchFilters reports whether a row satisfies every clause.
-func matchFilters(filters []*filter, cells []string) bool {
+// matchFilters reports whether a row satisfies every clause. derived holds the
+// row's --col values, which a clause may name.
+func matchFilters(filters []*filter, cells, derived []string) bool {
 	for _, flt := range filters {
-		cell := ""
-		if flt.idx >= 0 && flt.idx < len(cells) {
-			cell = cells[flt.idx]
-		}
-		if !flt.match(cell) {
+		if !flt.match(formulaValueAt(cells, derived, flt.idx)) {
 			return false
 		}
 	}

@@ -694,17 +694,17 @@ func TestMatchFiltersANDsClauses(t *testing.T) {
 	for i, flt := range filters {
 		flt.idx = i
 	}
-	if !matchFilters(filters, []string{"5000", "DONE"}) {
+	if !matchFilters(filters, []string{"5000", "DONE"}, nil) {
 		t.Error("both clauses hold, want match")
 	}
-	if matchFilters(filters, []string{"5000", "open"}) {
+	if matchFilters(filters, []string{"5000", "open"}, nil) {
 		t.Error("second clause fails, want no match")
 	}
-	if matchFilters(filters, []string{"10", "DONE"}) {
+	if matchFilters(filters, []string{"10", "DONE"}, nil) {
 		t.Error("first clause fails, want no match")
 	}
 	// A row shorter than the filter's column index reads as empty.
-	if matchFilters(filters, []string{"5000"}) {
+	if matchFilters(filters, []string{"5000"}, nil) {
 		t.Error("missing cell should not satisfy status=done")
 	}
 }
@@ -1287,5 +1287,176 @@ func TestBuildMarkdownKeepsCellsInsideTheirColumns(t *testing.T) {
 	want := "| a | b |\n| --- | --- |\n| x\\|y | l1 l2 |\n"
 	if body != want {
 		t.Errorf("buildMarkdown =\n%q\nwant\n%q", body, want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Formulas (formula.go)
+// ---------------------------------------------------------------------------
+
+// scanWith scans a formula against a fixed header, and renders it with a cell
+// reference for each column, which is what --col does per row.
+func scanWith(t *testing.T, formula string, header ...string) (string, error) {
+	t.Helper()
+	ctx := &formulaContext{
+		header: header,
+		sheets: []string{"明细", "目标表"},
+		flag:   "col",
+	}
+	parts, err := scanFormula(formula, ctx)
+	if err != nil {
+		return "", err
+	}
+	return parts.render(func(idx int) (string, error) {
+		return "<" + columnLetter(idx+1) + ">", nil
+	})
+}
+
+func TestScanFormulaRewritesColumnNames(t *testing.T) {
+	cases := []struct {
+		formula string
+		want    string
+	}{
+		// A bare column name becomes a reference, and functions do not.
+		{"MONTH(过账日期)", "MONTH(<B>)"},
+		{"收入金额*IF(单位=\"千元\",1000,1)", "<J>*IF(<I>=\"千元\",1000,1)"},
+		// A name inside a string literal is text, not a column.
+		{"IF(单位=\"收入金额\",1,2)", "IF(<I>=\"收入金额\",1,2)"},
+		// A sheet-qualified reference is left to the engine.
+		{"VLOOKUP(客户编号,目标表!$A:$B,2,FALSE)", "VLOOKUP(<E>,目标表!$A:$B,2,FALSE)"},
+		{"'目标表'!A1*收入金额", "'目标表'!A1*<J>"},
+		// Cell references and numbers survive.
+		{"A1*2+$B$3", "A1*2+$B$3"},
+		{"SUM(B:B)", "SUM(B:B)"},
+		// A name that holds a parenthesis is read as a whole when it matches.
+		{"金额(万元)*2", "<C>*2"},
+		{"[金额(万元)]*2", "<C>*2"},
+		// A function the engine knows, with a name that is also a column,
+		// resolves as the function: IF is not a column here.
+		{"TRIM(备注)", "TRIM(<M>)"},
+	}
+	for _, test := range cases {
+		got, err := scanWith(t, test.formula, "凭证号", "过账日期", "金额(万元)", "E",
+			"客户编号", "F", "G", "H", "单位", "收入金额", "K", "L", "备注")
+		if err != nil {
+			t.Errorf("scanFormula(%q): %v", test.formula, err)
+			continue
+		}
+		if got != test.want {
+			t.Errorf("scanFormula(%q) = %q, want %q", test.formula, got, test.want)
+		}
+	}
+}
+
+func TestScanFormulaRejectsWhatCannotWork(t *testing.T) {
+	cases := []struct {
+		formula string
+		message string
+	}{
+		// The same command twice must not answer differently.
+		{"MONTH(NOW())", "NOW"},
+		{"TODAY()", "TODAY"},
+		{"RAND()", "RAND"},
+		{"RANDBETWEEN(1,10)", "RANDBETWEEN"},
+		// A typo is one message, not one per row.
+		{"MONTH(过帐日期)", "过帐日期"},
+		{"VLOOKUP(客户编号,不存在的表!$A:$B,2,FALSE)", "does not exist"},
+		{"SUM(金额", "unbalanced"},
+	}
+	for _, test := range cases {
+		_, err := scanWith(t, test.formula, "过账日期", "客户编号", "金额")
+		if err == nil {
+			t.Errorf("scanFormula(%q) accepted, want an error naming %q", test.formula, test.message)
+			continue
+		}
+		if !strings.Contains(err.Error(), test.message) {
+			t.Errorf("scanFormula(%q) = %v, want it to mention %q", test.formula, err, test.message)
+		}
+	}
+}
+
+func TestFormulaValueAtReadsDerivedColumns(t *testing.T) {
+	cells := []string{"a", "b"}
+	derived := []string{"x", "y"}
+	// A derived column is numbered from -2, so that -1 stays "unresolved".
+	if got := formulaValueAt(cells, derived, -2); got != "x" {
+		t.Errorf("formulaValueAt(-2) = %q, want x", got)
+	}
+	if got := formulaValueAt(cells, derived, -3); got != "y" {
+		t.Errorf("formulaValueAt(-3) = %q, want y", got)
+	}
+	if got := formulaValueAt(cells, derived, -1); got != "" {
+		t.Errorf("formulaValueAt(-1) = %q, want an unresolved index to read empty", got)
+	}
+	if got := formulaValueAt(cells, derived, 1); got != "b" {
+		t.Errorf("formulaValueAt(1) = %q, want b", got)
+	}
+}
+
+func TestFormulaColumnNameRejectsAmbiguity(t *testing.T) {
+	for _, name := range []string{"", "2", "B", "AA", "A1", "$B$2"} {
+		if err := formulaColumnName(name); err == nil {
+			t.Errorf("formulaColumnName(%q) accepted, want a rejection", name)
+		}
+	}
+	for _, name := range []string{"月", "净利率", "share"} {
+		if err := formulaColumnName(name); err != nil {
+			t.Errorf("formulaColumnName(%q) = %v, want it accepted", name, err)
+		}
+	}
+}
+
+func TestAdditiveFieldsExcludeWhatHasNoTotal(t *testing.T) {
+	specs := []*aggSpec{
+		{kind: kindSum, name: "sum_收入"},
+		{kind: kindAvg, name: "avg_收入"},
+		{kind: kindMax, name: "max_收入"},
+		{kind: kindCountDistinct, name: "distinct_客户"},
+		{kind: kindSum, name: "收入"},
+	}
+	got := strings.Join(additiveFields(specs, true), ",")
+	if got != "sum_收入,收入,count" {
+		t.Errorf("additiveFields = %q, want the sums and the count", got)
+	}
+	if len(additiveFields(specs, false)) != 2 {
+		t.Errorf("additiveFields without --count = %v, want two sums",
+			additiveFields(specs, false))
+	}
+}
+
+func TestFormulaResultKeepsTextAndDropsEmpty(t *testing.T) {
+	cases := []struct {
+		value string
+		want  any
+	}{
+		{"120", float64(120)},
+		{"1.5E+3", float64(1500)},
+		{"", nil},
+		{"2023-05-02", "2023-05-02"},
+		{"VLOOKUP no result found", "VLOOKUP no result found"},
+	}
+	for _, test := range cases {
+		got := formulaResult(test.value)
+		if got != test.want {
+			t.Errorf("formulaResult(%q) = %#v, want %#v", test.value, got, test.want)
+		}
+	}
+}
+
+func TestScratchValueReadsNumbersTheWaySumDoes(t *testing.T) {
+	cases := []struct {
+		cell string
+		want any
+	}{
+		{"1,234.50", float64(1234.5)},
+		{"12.35%", float64(0.1235)},
+		{"¥100", float64(100)},
+		{"华东", "华东"},
+		{"", ""},
+	}
+	for _, test := range cases {
+		if got := scratchValue(test.cell); got != test.want {
+			t.Errorf("scratchValue(%q) = %#v, want %#v", test.cell, got, test.want)
+		}
 	}
 }

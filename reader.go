@@ -544,6 +544,11 @@ type pageRequest struct {
 	fillMerged bool
 	dates      string
 	maxColumns int
+	// colArgs are the --col formulas as the caller wrote them. They are scanned
+	// inside readPage because the header they name columns from is only read
+	// there, and cols holds the result.
+	colArgs []string
+	cols    *derivedSet
 }
 
 // pageResult is a page of rows, already padded to a uniform width.
@@ -560,6 +565,11 @@ type pageResult struct {
 	approximate bool
 	scanned     int
 	warnings    []string
+	// derived holds each returned row's --col values, kept alongside the row
+	// until the page's width is known and they can be appended to it, and
+	// derivedNames are their column names.
+	derived      [][]string
+	derivedNames []string
 }
 
 // readPage streams one page out of a worksheet.
@@ -580,8 +590,15 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 	firstDataRow := 1
 	if req.headerRow > 0 {
 		firstDataRow = req.headerRow + 1
-	} else if err = resolveFilters(req.filters, nil); err != nil {
-		return nil, err
+	} else {
+		if len(req.colArgs) > 0 {
+			return nil, usageFailure(errors.New(
+				"--col needs a header row: a derived column is referred to by name, and a sheet " +
+					"read without one has no names to refer to"))
+		}
+		if err = resolveFilters(req.filters, nil, nil); err != nil {
+			return nil, err
+		}
 	}
 
 	var (
@@ -616,6 +633,11 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 		return merges.apply(row, cells, req.maxColumns)
 	}
 
+	// The engine adds its scratch worksheet lazily and removes it on the way
+	// out, so a page that computes nothing never touches the workbook.
+	engine := newFormulaEngine(f)
+	defer engine.close()
+
 	for iter.Next() {
 		pos++
 		var stored []string
@@ -636,7 +658,23 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 					return nil, err
 				}
 				res.header = applyMerges(pos, res.header)
-				if err = resolveFilters(req.filters, res.header); err != nil {
+				// The --col formulas are scanned here because this is the first
+				// moment their column names can be resolved, and they are scanned
+				// before the filters because a filter may name one of them.
+				if len(req.colArgs) > 0 && req.cols == nil {
+					ctx := &formulaContext{
+						header:  res.header,
+						sheets:  userSheets(f),
+						defined: definedNames(f),
+						flag:    "col",
+					}
+					cols, colErr := parseDerivedColumns(req.colArgs, ctx)
+					if colErr != nil {
+						return nil, usageFailure(colErr)
+					}
+					req.cols = cols
+				}
+				if err = resolveFilters(req.filters, res.header, req.cols); err != nil {
 					return nil, err
 				}
 			}
@@ -660,6 +698,16 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 		if dates != nil {
 			cells = dates.apply(req.sheet, pos, cells, stored)
 		}
+		// Derived columns are computed before anything reads the row, so that
+		// --where compares the value the caller named rather than the formula
+		// that produces it.
+		rowDerived, err := req.cols.eval(engine, req.sheet, pos, cells)
+		if err != nil {
+			// A formula that cannot work at all — an unsupported function, a
+			// misspelled column — ends the scan with its own message instead of
+			// being repeated for every row left in the sheet.
+			return nil, usageFailure(err)
+		}
 		if len(res.rows) == req.limit {
 			// The page is complete. Keep going, but only to establish whether
 			// another matching row exists, and give up after a bounded number
@@ -671,7 +719,7 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 				break
 			}
 		}
-		if len(req.filters) > 0 && !matchFilters(req.filters, cells) {
+		if len(req.filters) > 0 && !matchFilters(req.filters, cells, rowDerived) {
 			continue
 		}
 		// A sparse worksheet yields a position for every row number up to its
@@ -709,6 +757,7 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 		}
 		res.lastRow = pos
 		res.rows = append(res.rows, cells)
+		res.derived = append(res.derived, rowDerived)
 	}
 	if err = iter.Error(); err != nil {
 		return nil, err
@@ -716,6 +765,7 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 	// A filter that answered in text something the caller asked in numbers says
 	// so here, once, rather than in the result set where it cannot be seen.
 	res.warnings = append(res.warnings, filterWarnings(req.filters)...)
+	res.warnings = append(res.warnings, req.cols.warnings()...)
 
 	// Pad every row to a common width so the page has a stable shape. The
 	// width comes from the rows actually returned rather than from the
@@ -731,10 +781,26 @@ func readPage(f *excelize.File, req pageRequest) (*pageResult, error) {
 	if req.maxColumns > 0 && width > req.maxColumns {
 		width, res.widthCapped = req.maxColumns, true
 	}
-	res.width = width
-	for i := range res.rows {
-		res.rows[i] = padRow(res.rows[i], width)
+	// The derived columns go after the sheet's own, at a position that does not
+	// depend on the width of any individual row: a row is padded to the page
+	// width first and the derived values follow it, so every row in the page has
+	// them in the same place. --max-columns bounds what is read out of the
+	// sheet; a column the caller asked to have computed is added on top rather
+	// than capped away.
+	if req.cols != nil {
+		res.derivedNames = req.cols.names()
+		res.header = padRow(res.header, width)
+		res.header = append(res.header, res.derivedNames...)
+		for i := range res.rows {
+			res.rows[i] = append(padRow(res.rows[i], width), res.derived[i]...)
+		}
+		width += len(req.cols.cols)
+	} else {
+		for i := range res.rows {
+			res.rows[i] = padRow(res.rows[i], width)
+		}
 	}
+	res.width = width
 	if res.widthCapped {
 		res.warnings = append(res.warnings, fmt.Sprintf(
 			"page is wider than --max-columns=%d; columns beyond %s were dropped",

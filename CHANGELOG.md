@@ -6,6 +6,96 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-17
+
+The third external review was a capability request rather than a defect report:
+the workbook's own formula engine was already wired in for `--calc`, and the
+office questions it was not reachable from — trend by month, a median that an
+outlier cannot move, a lookup, a share of the total — had to be answered outside
+the tool or not at all. Three flags open it up, and the boundary work is the
+part that matters: an engine that answers a slightly different question every
+run, or that turns a failed formula into an empty cell, would be worse than the
+gap it fills.
+
+### Added
+
+- **`--col "name=FORMULA"` — a column computed per row** (`agg` and `read`,
+  repeatable). Column names are written the way a spreadsheet user writes them,
+  so the formula is `MONTH(过账日期)`, not `MONTH($B2)`. The result is a column
+  like any other: groupable, filterable, sortable, usable inside `--sum` and
+  `--agg`, and referenceable by a later `--col`. A text date works directly —
+  `MONTH` on a cell holding `"2023-05-02"` coerces it, so a column that merely
+  looks like a date can still be used to derive one, and a column that is not a
+  date gives `#VALUE!` rather than a silent 0. Cross-sheet references pass
+  through untouched, which is what makes `VLOOKUP(客户编号,目标!$A:$B,2,FALSE)`
+  work without any lookup syntax of our own.
+- **`--agg "name=FORMULA"` — an aggregate computed per group** (`agg`,
+  repeatable). The rows of a group are almost never contiguous, so each column
+  the formula reads is written to a scratch worksheet as one block per group and
+  handed to the engine as a range: `MEDIAN(金额)`, `PERCENTILE(金额,0.9)`,
+  `STDEV(金额)`, `COUNTIFS(金额,">100000",区域,"华东")` and the rest of the
+  engine's 900-odd functions work over exactly the rows the group holds. It
+  coexists with `--sum`/`--avg`/`--min`/`--max`/`--count`, and `--derive` still
+  works on the result.
+- **`--share` — each group's percentage of the total** (`agg`). Emits
+  `share_<field>` for every summed field and for `count`. The total comes from
+  the same scan as the groups, so a numerator and its denominator cannot belong
+  to two different versions of the file, and the shares of a grouping add up to
+  exactly 1. A `--where` narrows the total as well as the groups. The same
+  number is available to `--derive` as `_total_<field>`, as in
+  `--derive "占比=sum_收入金额/_total_sum_收入金额"`.
+- Formula evaluation is documented as seeing the **stored** values of the sheet
+  — the same values whatever `--raw` and `--dates` say — and as needing a header
+  row (`--header` or `--header-row N`), because a derived column is referred to
+  by name.
+
+### Fixed / Guarded against
+
+- **Volatile functions are refused, not evaluated.** `NOW`, `TODAY`, `RAND` and
+  `RANDBETWEEN` are silently computed by the engine, so a command containing one
+  returns a different number on every run — the opposite of what a tool used to
+  reconcile figures is for. They are a usage error naming the function.
+- **A function the engine does not implement says so once, with its name.**
+  `QUARTER(过账日期)` fails the command (`USAGE`, exit 2) instead of producing a
+  column of empty values; the message repeats that `ROUNDUP(MONTH(d)/3,0)` is
+  the same value. A misspelled column name, a reference to a sheet that is not
+  in the workbook, and a malformed formula are all caught before the scan starts
+  rather than once per row.
+- **An `--agg` over a column that held nothing reports the column, not a
+  quiet zero.** A formula cell whose result was never cached — what openpyxl,
+  pandas and xlsxwriter produce — reads as empty, and the engine answers `SUM`
+  over it with `0`: a number where the same question asked through `--sum`
+  returns `null` and a warning. The warning now exists on both paths, and
+  `--calc` is the fix on both. A `--col` formula needs no `--calc` for this, and
+  that is documented rather than left to be discovered: it reads through the
+  engine, which evaluates the formula cell it references.
+- **A row the engine cannot compute is data, and says so.** `#DIV/0!`,
+  `#VALUE!`, `#NUM!` and `VLOOKUP no result found` are passed through as the
+  cell's value — an empty cell and a lookup that found nothing are different
+  facts — counted per column, and summarised in `warnings`. A group whose
+  `--agg` could not be computed reports `null`, with one warning naming how many
+  of how many groups were affected.
+- **The scratch worksheet never survives the command.** It is created on first
+  evaluation, removed on the way out including on the failure paths, and hidden
+  from every message that lists the workbook's sheets. A `serve` session that
+  runs a formula request leaves the cached workbook exactly as it found it.
+- **A whole-column reference is reported as the cost it is.** `VLOOKUP(x,目标!$A:$B,2,FALSE)`
+  is ordinary spreadsheet practice and, here, the rows evaluated times the rows
+  the range holds: 44 s for 2,700 rows against a 2,700-row column, 0.8 s against
+  a 100-row range. The answer is right, so this is a warning rather than a
+  refusal — but a 44-second command with no explanation reads as a hang, so the
+  response names the reference and the arithmetic.
+- `profile`'s `type` is documented for what it is: the **usable** type of a
+  column, read from how the value presents itself, not from how the cell stores
+  it. A date stored as text is `date` — and is directly usable as one, as above
+  — while `--raw` still returns the string the file holds.
+
+### Changed
+
+- `--max-columns` caps the columns read from the worksheet; `--col` columns are
+  added after them rather than being capped away, because a column the caller
+  asked to have computed is not something to drop silently.
+
 ## [1.0.3] - 2026-09-17
 
 Fixes for the fifteen findings of a second external review of 1.0.2, which
@@ -202,7 +292,8 @@ Behaviour aimed at a caller that cannot see the data itself:
 - Error codes distinguish `PASSWORD_REQUIRED` from `INVALID_PASSWORD`, and name
   the available sheets or columns so a caller can correct itself in one step.
 
-[Unreleased]: https://github.com/jbeetle/xlpeek/compare/v1.0.3...HEAD
+[Unreleased]: https://github.com/jbeetle/xlpeek/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/jbeetle/xlpeek/compare/v1.0.3...v1.1.0
 [1.0.3]: https://github.com/jbeetle/xlpeek/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/jbeetle/xlpeek/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/jbeetle/xlpeek/releases/tag/v1.0.1

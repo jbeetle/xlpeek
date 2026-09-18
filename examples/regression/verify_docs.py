@@ -61,6 +61,11 @@ def runnable(cmd):
 
 
 def substitute(token):
+    # Some names appear *inside* an argument rather than as one — a sheet name
+    # written in a formula, where the token is the whole formula — so they are
+    # rewritten before the anchored patterns get a look at it.
+    for old, new in (('目标表', 'FY24_收入明细'),):
+        token = token.replace(old, new)
     # A comma-separated flag value carries several names in one token, as in
     # --columns "订单号,金额", so each part has to be mapped separately.
     if ',' in token:

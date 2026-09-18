@@ -124,6 +124,18 @@ func badColumn(err error) error {
 	return &argumentFailure{code: codeColumnNotFound, err: err}
 }
 
+// usageFailure tags a failure that is the command's own fault without being
+// about one column: a --col formula the engine cannot compute, or one written
+// for a sheet that has no header row to name columns from. It carries USAGE and
+// exit 2 because the same command with the same file will fail the same way,
+// and the caller is the one who can fix it.
+func usageFailure(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &argumentFailure{code: codeUsage, err: err}
+}
+
 // exitFor reports the status a failure should end with: 2 when editing the
 // command is what would fix it, 1 when the command was fine and the workbook,
 // the path or the environment was not.

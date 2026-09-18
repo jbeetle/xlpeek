@@ -250,22 +250,26 @@ func parseDimension(ref string) (rows, cols int) {
 // ---------------------------------------------------------------------------
 
 type readResult struct {
-	File         string   `json:"file"`
-	Sheet        string   `json:"sheet"`
-	SheetIndex   int      `json:"sheet_index"`
-	HeaderMode   bool     `json:"header_mode"`
-	HeaderRow    int      `json:"header_row,omitempty"`
-	SkipEmpty    bool     `json:"skip_empty,omitempty"`
-	FillMerged   bool     `json:"fill_merged,omitempty"`
-	Dates        string   `json:"dates,omitempty"`
-	Header       []string `json:"header,omitempty"`
-	Columns      []string `json:"columns"`
-	Format       string   `json:"format,omitempty"`
-	Offset       int      `json:"offset"`
-	Limit        int      `json:"limit"`
-	RowsReturned int      `json:"rows_returned"`
-	FirstRow     int      `json:"first_row,omitempty"`
-	LastRow      int      `json:"last_row,omitempty"`
+	File       string   `json:"file"`
+	Sheet      string   `json:"sheet"`
+	SheetIndex int      `json:"sheet_index"`
+	HeaderMode bool     `json:"header_mode"`
+	HeaderRow  int      `json:"header_row,omitempty"`
+	SkipEmpty  bool     `json:"skip_empty,omitempty"`
+	FillMerged bool     `json:"fill_merged,omitempty"`
+	Dates      string   `json:"dates,omitempty"`
+	Header     []string `json:"header,omitempty"`
+	Columns    []string `json:"columns"`
+	// DerivedColumns names the --col columns, which follow the sheet's own
+	// columns in every row and in header_keys. Without it a caller reading a
+	// page would have to work out which trailing values came from a formula.
+	DerivedColumns []string `json:"derived_columns,omitempty"`
+	Format         string   `json:"format,omitempty"`
+	Offset         int      `json:"offset"`
+	Limit          int      `json:"limit"`
+	RowsReturned   int      `json:"rows_returned"`
+	FirstRow       int      `json:"first_row,omitempty"`
+	LastRow        int      `json:"last_row,omitempty"`
 	// Complete states plainly whether this page is the whole answer. A caller
 	// that has to invert has_more to work that out may not bother, and then
 	// reports a page as if it were the table.
@@ -301,8 +305,11 @@ func cmdRead(args []string) int {
 	raw := fs.Bool("raw", false, "return stored values instead of number-formatted values")
 	tmpDir := fs.String("tmpdir", "", "directory for temporary files (default: system temp)")
 	pretty := fs.Bool("pretty", false, "indent the JSON output")
-	var wheres stringSlice
+	var wheres, colArgs stringSlice
 	fs.Var(&wheres, "where", "row filter, repeatable and ANDed, e.g. --where \"金额>1000\" or --where \"状态~完成\"")
+	fs.Var(&colArgs, "col", "column computed per row by an Excel formula, e.g. "+
+		"--col \"月=MONTH(过账日期)\"; usable in --where and --columns; needs a header row "+
+		"and loads the sheet into memory; repeatable")
 
 	operands, code, ok := parseFlags(fs, args)
 	if !ok {
@@ -343,6 +350,13 @@ func cmdRead(args []string) int {
 	if *headerRow > 0 {
 		headerAt = *headerRow
 	}
+	// A derived column is referred to by name, so it needs a row of names to be
+	// named in. Without one there is nothing to name it with and no way for a
+	// caller to reach the result.
+	if len(colArgs) > 0 && headerAt == 0 {
+		return failUsage("read", "--col needs --header (or --header-row N): a derived column is "+
+			"referred to by name, and a sheet read without a header row has none")
+	}
 	filters, err := parseFilterList(wheres)
 	if err != nil {
 		return failUsage("read", err.Error())
@@ -372,9 +386,10 @@ func cmdRead(args []string) int {
 		fillMerged: *fillMerged,
 		dates:      *dates,
 		maxColumns: *maxColumns,
+		colArgs:    colArgs,
 	})
 	if err != nil {
-		return failWithSheet("read", err, f.GetSheetList(), *pretty)
+		return failWithSheet("read", err, userSheets(f), *pretty)
 	}
 
 	projection, err := buildProjection(columns, res.header, res.width)
@@ -401,26 +416,27 @@ func cmdRead(args []string) int {
 	projected := projectRows(res.rows, projection)
 
 	result := &readResult{
-		File:          path,
-		Sheet:         res.sheet,
-		SheetIndex:    res.sheetIndex,
-		HeaderMode:    headerAt > 0,
-		HeaderRow:     headerAt,
-		SkipEmpty:     *skipEmpty,
-		FillMerged:    *fillMerged,
-		Header:        res.header,
-		Columns:       outColumns,
-		Offset:        *offset,
-		Limit:         *limit,
-		RowsReturned:  len(res.rows),
-		FirstRow:      res.firstRow,
-		LastRow:       res.lastRow,
-		HasMore:       res.hasMore,
-		HasMoreApprox: res.approximate,
-		RowsScanned:   res.scanned,
-		Warnings:      res.warnings,
-		Format:        *format,
-		Rows:          buildRows(projected, outNames, headerAt > 0),
+		File:           path,
+		Sheet:          res.sheet,
+		SheetIndex:     res.sheetIndex,
+		HeaderMode:     headerAt > 0,
+		HeaderRow:      headerAt,
+		SkipEmpty:      *skipEmpty,
+		FillMerged:     *fillMerged,
+		Header:         res.header,
+		Columns:        outColumns,
+		DerivedColumns: res.derivedNames,
+		Offset:         *offset,
+		Limit:          *limit,
+		RowsReturned:   len(res.rows),
+		FirstRow:       res.firstRow,
+		LastRow:        res.lastRow,
+		HasMore:        res.hasMore,
+		HasMoreApprox:  res.approximate,
+		RowsScanned:    res.scanned,
+		Warnings:       res.warnings,
+		Format:         *format,
+		Rows:           buildRows(projected, outNames, headerAt > 0),
 	}
 	if *dates != datesDisplay {
 		result.Dates = *dates

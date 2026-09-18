@@ -367,7 +367,7 @@ func cmdProfile(args []string) int {
 			}
 		}
 		if !resolved {
-			if err = resolveFilters(filters, header); err != nil {
+			if err = resolveFilters(filters, header, nil); err != nil {
 				return respondErr("profile", codeColumnNotFound, err.Error(), *pretty, exitUsage)
 			}
 			for _, name := range wanted {
@@ -380,7 +380,7 @@ func cmdProfile(args []string) int {
 			resolved = true
 		}
 		rowsScanned++
-		if len(filters) > 0 && !matchFilters(filters, cells) {
+		if len(filters) > 0 && !matchFilters(filters, cells, nil) {
 			continue
 		}
 		if *skipEmpty && !nonEmpty(cells) {
@@ -398,7 +398,7 @@ func cmdProfile(args []string) int {
 	if !resolved {
 		// An empty sheet still has to resolve, or a bad column name would look
 		// like an empty result instead of an error.
-		if err = resolveFilters(filters, header); err != nil {
+		if err = resolveFilters(filters, header, nil); err != nil {
 			return respondErr("profile", codeColumnNotFound, err.Error(), *pretty, exitUsage)
 		}
 		for _, name := range wanted {

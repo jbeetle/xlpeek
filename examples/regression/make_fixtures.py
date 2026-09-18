@@ -96,6 +96,43 @@ def sheet_bracketed(wb):
     ws.append([400, 200])
 
 
+def sheet_formula(wb):
+    """公式: the workbook a --col or an --agg formula is measured against.
+
+    Sized by hand so that every expectation in regress_round3.py can be checked
+    on paper, and shaped like the review that asked for the feature: 部门 A holds
+    an outlier, so its mean is 2092 while its median is 120, and the two are not
+    interchangeable. The rest of the sheet is the awkward cases — a divisor of
+    zero, a code the lookup sheet does not hold, and a padded text column.
+    """
+    ws = wb.create_sheet("公式")
+    ws.append(["部门", "金额", "区域", "编号", "分母", "代码"])
+    for row in (
+        ("A", 100, "华东", " A-1 ", 2, "K1"),
+        ("A", 110, "华东", "A-2", 5, "K2"),
+        ("A", 120, "华东", "A-3 ", 4, "K3"),
+        ("A", 130, "华南", "A-4", 0, "K9"),
+        ("A", 10000, "华东", "A-5", 8, "K1"),
+        ("B", 200, "华北", " B-1 ", 2, "K2"),
+        ("B", 400, "华北", "B-2", 4, "K3"),
+        ("B", 600, "华北", "B-3", 5, "K1"),
+    ):
+        ws.append(list(row))
+
+
+def sheet_lookup(wb):
+    """字典: the table a cross-sheet VLOOKUP reads.
+
+    K9 is deliberately absent, so a lookup of every row has one that finds
+    nothing — the case where an empty cell and a failed lookup must not read
+    the same.
+    """
+    ws = wb.create_sheet("字典")
+    ws.append(["代码", "目标值"])
+    for code, target in (("K1", 11), ("K2", 22), ("K3", 33)):
+        ws.append([code, target])
+
+
 def sheet_high_cardinality(wb):
     """高基数: past the point where grouping stops summarising.
 
@@ -112,7 +149,8 @@ def build():
     wb = Workbook()
     wb.remove(wb.active)  # the default sheet has no part in the fixture
     for sheet in (sheet_filters, sheet_dates, sheet_trailing,
-                  sheet_bracketed, sheet_high_cardinality):
+                  sheet_bracketed, sheet_high_cardinality,
+                  sheet_formula, sheet_lookup):
         sheet(wb)
     TARGET.parent.mkdir(parents=True, exist_ok=True)
     wb.save(str(TARGET))

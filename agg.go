@@ -75,6 +75,32 @@ var aggPrefix = map[string]string{
 	kindCountDistinct: "distinct_",
 }
 
+// How a share and a grand total are named. A share is prefixed so that it can
+// never collide with the field it shares out, and a total is written with a
+// leading underscore in --derive because it is not an output field at all.
+const (
+	sharePrefix = "share_"
+	totalPrefix = "_total_"
+)
+
+// additiveFields names the fields a share can be taken of: the sums, and the
+// row count. An average, a minimum, a maximum, a distinct count and a formula
+// aggregate are all non-additive — the average of a group is not a part of the
+// overall average — so a percentage of one of them would be a figure with no
+// meaning rather than a figure with a meaning that is merely surprising.
+func additiveFields(specs []*aggSpec, count bool) []string {
+	var out []string
+	for _, spec := range specs {
+		if spec.kind == kindSum {
+			out = append(out, spec.name)
+		}
+	}
+	if count {
+		out = append(out, "count")
+	}
+	return out
+}
+
 type aggSpec struct {
 	kind   string
 	name   string // output field, e.g. sum_收入金额
@@ -436,6 +462,12 @@ type groupState struct {
 	keys []string
 	aggs []*aggState
 	rows int
+	// formulaValues holds this group's rows for the columns the --agg formulas
+	// read, one slice per column, filled only when there is an --agg to compute.
+	// A group is defined by a value rather than by a position, so its rows are
+	// usually scattered across the sheet and cannot be handed to the engine as a
+	// range until they have been collected here.
+	formulaValues [][]any
 }
 
 type deriveSpec struct {
@@ -493,12 +525,19 @@ func cmdAgg(args []string) int {
 	tmpDir := fs.String("tmpdir", "", "directory for temporary files (default: system temp)")
 	pretty := fs.Bool("pretty", false, "indent the JSON output")
 	count := fs.Bool("count", false, "include the number of matched rows per group")
+	share := fs.Bool("share", false, "add share_<field> percentages of the total for each summed field")
 	var sums, avgs, mins, maxs, distincts, deriveArgs, wheres stringSlice
+	var colArgs, aggArgs stringSlice
 	fs.Var(&sums, "sum", "sum of an expression, e.g. --sum 收入金额 or --sum \"净利=收入金额-成本金额\"; repeatable")
 	fs.Var(&avgs, "avg", "average of an expression; repeatable")
 	fs.Var(&mins, "min", "minimum of an expression; repeatable")
 	fs.Var(&maxs, "max", "maximum of an expression; repeatable")
 	fs.Var(&distincts, "count-distinct", "count of distinct non-empty values in a column; repeatable")
+	fs.Var(&aggArgs, "agg", "aggregate computed per group by an Excel formula over the group's rows, "+
+		"e.g. --agg \"中位金额=MEDIAN(收入金额)\"; loads the sheet into memory; repeatable")
+	fs.Var(&colArgs, "col", "column computed per row by an Excel formula, e.g. "+
+		"--col \"月=MONTH(过账日期)\"; usable in --group-by, --where, --sort-by and the "+
+		"aggregates; needs a header row and loads the sheet into memory; repeatable")
 	fs.Var(&deriveArgs, "derive", "metric computed from aggregate fields, e.g. --derive \"毛利率=(sum_收入金额-sum_成本金额)/sum_收入金额\"; repeatable")
 	fs.Var(&wheres, "where", "row filter applied before aggregating; repeatable and ANDed")
 
@@ -563,9 +602,22 @@ func cmdAgg(args []string) int {
 			kind: kindCountDistinct, name: name, source: source, index: -1,
 		})
 	}
-	if len(specs) == 0 && !*count {
+	// A formula aggregate is named here and scanned once the header is known,
+	// because a formula that reads a column cannot be checked without the
+	// column names — and checking it late is the whole point: an unsupported
+	// function or a misspelled column must be one message, not one per row.
+	var formulaArgs []formulaAgg
+	for _, item := range aggArgs {
+		name, source, err := splitNamedFormula(item)
+		if err != nil {
+			return failUsage("agg", fmt.Sprintf("--agg %q: %v", item, err))
+		}
+		formulaArgs = append(formulaArgs, formulaAgg{name: name, source: source})
+	}
+
+	if len(specs) == 0 && !*count && len(formulaArgs) == 0 {
 		return failUsage("agg", "nothing to compute: give at least one of "+
-			"--sum, --avg, --min, --max, --count-distinct or --count")
+			"--sum, --avg, --min, --max, --count-distinct, --agg or --count")
 	}
 
 	var derives []*deriveSpec
@@ -584,31 +636,65 @@ func cmdAgg(args []string) int {
 	}
 
 	// Output field order: aggregate results, then the row count, then the
-	// derived metrics.
-	fieldNames := make([]string, 0, len(specs)+1+len(derives))
+	// shares, then the derived metrics.
+	fieldNames := make([]string, 0, len(specs)+len(formulaArgs)+1+len(derives)+len(specs))
 	for _, spec := range specs {
+		fieldNames = append(fieldNames, spec.name)
+	}
+	for _, spec := range formulaArgs {
 		fieldNames = append(fieldNames, spec.name)
 	}
 	if *count {
 		fieldNames = append(fieldNames, "count")
 	}
+	// Sharing is defined for what is additive: a sum, and a count. A group's
+	// average is not a share of the overall average, and a median has no total
+	// to be a part of, so emitting a percentage of one would be inventing a
+	// number rather than reporting one.
+	sharable := additiveFields(specs, *count)
+	if *share && len(sharable) == 0 {
+		return failUsage("agg", "--share needs something that can be shared, and neither "+
+			"--avg, --min, --max, --count-distinct nor --agg produces an additive figure; "+
+			"add --sum or --count, or drop --share")
+	}
+	if *share {
+		for _, name := range sharable {
+			fieldNames = append(fieldNames, sharePrefix+name)
+		}
+	}
 
 	// A derived metric can only reference fields that were actually computed,
-	// so a typo fails immediately instead of silently yielding null.
+	// so a typo fails immediately instead of silently yielding null. The
+	// grand total of a summed field is referenceable as _total_<field>, which
+	// is how a share is written without --share.
 	if len(derives) > 0 {
 		known := make(map[string]bool, len(fieldNames))
 		for _, name := range fieldNames {
 			known[name] = true
 		}
+		additive := make(map[string]bool, len(sharable))
+		for _, name := range sharable {
+			additive[name] = true
+		}
 		for _, d := range derives {
 			used := map[string]bool{}
 			identifiers(d.expr, used)
 			for id := range used {
-				if !known[id] {
-					return failUsage("agg", fmt.Sprintf(
-						"--derive %q references %q, which is not one of the computed fields: %s%s",
-						d.source, id, strings.Join(fieldNames, ", "), nearField(id, fieldNames)))
+				if known[id] {
+					continue
 				}
+				if rest, ok := strings.CutPrefix(id, totalPrefix); ok {
+					if additive[rest] {
+						continue
+					}
+					return failUsage("agg", fmt.Sprintf(
+						"--derive %q references %q, but only an additive field has a total: "+
+							"%s; an average, a median or a distinct count has none",
+						d.source, id, strings.Join(sharable, ", ")))
+				}
+				return failUsage("agg", fmt.Sprintf(
+					"--derive %q references %q, which is not one of the computed fields: %s%s",
+					d.source, id, strings.Join(fieldNames, ", "), nearField(id, fieldNames)))
 			}
 		}
 	}
@@ -618,6 +704,29 @@ func cmdAgg(args []string) int {
 
 	if err := validateUniqueFields(fieldNames); err != nil {
 		return failUsage("agg", err.Error())
+	}
+	// A group key and an aggregate are both written into the same row, so the
+	// two namespaces cannot overlap either: {"count": "华南", "count": 5} is one
+	// key to every parser, and the grouping column would be the copy that is
+	// lost. --col makes this easy to reach — a derived column named count, or a
+	// grouping by a column that an aggregate is also named after.
+	names := map[string]bool{}
+	for _, name := range splitList(groupBy) {
+		if names[name] {
+			return failUsage("agg", fmt.Sprintf(
+				"--group-by names %q twice, so every row would carry the key twice and a parser "+
+					"would keep only the last", name))
+		}
+		names[name] = true
+	}
+	for _, name := range fieldNames {
+		if names[name] {
+			return failUsage("agg", fmt.Sprintf(
+				"the grouping column %q and the output field %q share a name, so every row would "+
+					"carry the key twice and a parser would keep only the last; rename the field "+
+					"with name=expression, or group by a different column", name, name))
+		}
+		names[name] = true
 	}
 
 	filters, err := parseFilterList(wheres)
@@ -634,12 +743,12 @@ func cmdAgg(args []string) int {
 
 	sheetName, sheetIndex, err := resolveSheet(f, sheet)
 	if err != nil {
-		return failWithSheet("agg", err, f.GetSheetList(), *pretty)
+		return failWithSheet("agg", err, userSheets(f), *pretty)
 	}
 
 	iter, err := f.Rows(sheetName)
 	if err != nil {
-		return failWithSheet("agg", err, f.GetSheetList(), *pretty)
+		return failWithSheet("agg", err, userSheets(f), *pretty)
 	}
 	defer func() { _ = iter.Close() }()
 
@@ -649,7 +758,7 @@ func cmdAgg(args []string) int {
 	var merges *mergeFiller
 	if *fillMerged {
 		if merges, err = newMergeFiller(f, sheetName); err != nil {
-			return failWithSheet("agg", err, f.GetSheetList(), *pretty)
+			return failWithSheet("agg", err, userSheets(f), *pretty)
 		}
 	}
 
@@ -665,6 +774,15 @@ func cmdAgg(args []string) int {
 		firstDataRow = headerAt + 1
 	}
 	groupNames := splitList(groupBy)
+
+	// A derived column is referred to by name, so it needs a row of names to be
+	// named in. Without one there is nothing to write the name into and no way
+	// to address the result, and a column the caller cannot reach is not a
+	// feature.
+	if len(colArgs) > 0 && headerAt == 0 {
+		return failUsage("agg", "--col needs --header (or --header-row N): a derived column is "+
+			"referred to by name, and a sheet read without a header row has none")
+	}
 
 	var (
 		header      []string
@@ -691,7 +809,17 @@ func cmdAgg(args []string) int {
 		// Warnings raised while evaluating formulas, capped like every other
 		// per-cell report so a broken workbook cannot pad the response.
 		formulaWarnings []string
+		// The --col columns, the --agg formulas, and the engine that evaluates
+		// them. All three are built during resolve, once the header is known.
+		derived *derivedSet
+		runner  *formulaAggRunner
 	)
+
+	// The engine adds its scratch worksheet lazily, so a command that never
+	// evaluates a formula never touches the workbook, and removes it on the way
+	// out either way.
+	engine := newFormulaEngine(f)
+	defer engine.close()
 
 	// lookup reads a referenced column for the current row. It is defined once
 	// and reads the buffers that the row loop refills, so no allocation or
@@ -704,15 +832,50 @@ func cmdAgg(args []string) int {
 		return values[i], present[i]
 	}
 
+	// resolve binds every name the command mentioned to a column, which can only
+	// happen once the header row has been read. The --col formulas are scanned
+	// here too: they are the names a --group-by, a --where or an aggregate may
+	// refer to, so they have to exist before anything else is resolved.
 	resolve := func() error {
+		ctx := &formulaContext{
+			header:  header,
+			sheets:  userSheets(f),
+			defined: definedNames(f),
+			flag:    "col",
+		}
+		var err error
+		if derived == nil && len(colArgs) > 0 {
+			if derived, err = parseDerivedColumns(colArgs, ctx); err != nil {
+				// A formula that cannot be read is the command's fault, not the
+				// file's: the same command fails the same way on every run.
+				return usageFailure(err)
+			}
+		}
+		if runner == nil && len(formulaArgs) > 0 {
+			ctx.flag = "agg"
+			specs := make([]*formulaAgg, len(formulaArgs))
+			for i := range formulaArgs {
+				ctx.broadRefs = nil
+				if formulaArgs[i].parts, err = scanFormula(formulaArgs[i].source, ctx); err != nil {
+					return usageFailure(err)
+				}
+				formulaArgs[i].cols = formulaArgs[i].parts.columns()
+				formulaArgs[i].broadRefs = ctx.broadRefs
+				specs[i] = &formulaArgs[i]
+			}
+			runner = newFormulaAggRunner(specs, header)
+		}
+		// Every reference below is resolved through the derived columns first, so
+		// that a --col is reachable from --group-by, --where, the aggregates and
+		// the formulas alike.
 		for _, name := range groupNames {
-			idx, err := resolveColumn(name, header)
+			idx, err := resolveRowColumn(name, header, derived)
 			if err != nil {
 				return fmt.Errorf("--group-by %s: %w", name, err)
 			}
 			groupIdx = append(groupIdx, idx)
 		}
-		if err = resolveFilters(filters, header); err != nil {
+		if err = resolveFilters(filters, header, derived); err != nil {
 			return err
 		}
 		wanted := map[string]bool{}
@@ -737,7 +900,7 @@ func cmdAgg(args []string) int {
 		}
 		sort.Strings(names)
 		for _, name := range names {
-			idx, err := resolveColumn(name, header)
+			idx, err := resolveRowColumn(name, header, derived)
 			if err != nil {
 				return err
 			}
@@ -761,12 +924,18 @@ func cmdAgg(args []string) int {
 			}
 		}
 		// Anything a group key or an aggregate already names is accounted for.
-		// Every other column is what the comparability check watches.
+		// Every other column is what the comparability check watches. A derived
+		// column is not one of the sheet's columns and is therefore not watched:
+		// it is computed here, so it varies only as its formula says it does.
 		for _, idx := range groupIdx {
-			used[idx] = true
+			if idx >= 0 {
+				used[idx] = true
+			}
 		}
 		for _, idx := range refIndexes {
-			used[idx] = true
+			if idx >= 0 {
+				used[idx] = true
+			}
 		}
 		resolved = true
 		return nil
@@ -781,20 +950,20 @@ func cmdAgg(args []string) int {
 		if pos < firstDataRow {
 			if headerAt > 0 && pos == headerAt {
 				if header, err = iter.Columns(); err != nil {
-					return failWithSheet("agg", err, f.GetSheetList(), *pretty)
+					return failWithSheet("agg", err, userSheets(f), *pretty)
 				}
 				if merges != nil {
 					header = merges.apply(pos, header, defaultMaxColumns)
 				}
 				if err = resolve(); err != nil {
-					return respondErr("agg", codeColumnNotFound, err.Error(), *pretty, exitUsage)
+					return fail("agg", err, *pretty)
 				}
 			}
 			continue
 		}
 		cells, err := iter.Columns()
 		if err != nil {
-			return failWithSheet("agg", err, f.GetSheetList(), *pretty)
+			return failWithSheet("agg", err, userSheets(f), *pretty)
 		}
 		// A merged label is written into the cells the region spans before
 		// anything reads them, so grouping and filtering see the label the
@@ -816,14 +985,24 @@ func cmdAgg(args []string) int {
 		if !resolved {
 			// No header row: names cannot be used, but letters and indexes can.
 			if err = resolve(); err != nil {
-				return respondErr("agg", codeColumnNotFound, err.Error(), *pretty, exitUsage)
+				return fail("agg", err, *pretty)
 			}
 		}
 		rowsScanned++
-		if len(filters) > 0 && !matchFilters(filters, cells) {
+		if *skipEmpty && !nonEmpty(cells) {
 			continue
 		}
-		if *skipEmpty && !nonEmpty(cells) {
+		// The derived columns are computed before anything reads the row, so
+		// that --where and --group-by see the value the caller named rather than
+		// the formula that produces it.
+		rowDerived, err := derived.eval(engine, sheetName, pos, cells)
+		if err != nil {
+			// A formula that cannot work at all — an unsupported function, a
+			// misspelled column — stops the command with its message rather than
+			// repeating it on every row left in the sheet.
+			return respondErr("agg", codeUsage, err.Error(), *pretty, exitUsage)
+		}
+		if len(filters) > 0 && !matchFilters(filters, cells, rowDerived) {
 			continue
 		}
 		rowsMatched++
@@ -867,7 +1046,7 @@ func cmdAgg(args []string) int {
 				// meant to be numbers.
 				continue
 			}
-			raw := valueAt(cells, idx)
+			raw := formulaValueAt(cells, rowDerived, idx)
 			if raw == "" {
 				continue
 			}
@@ -889,7 +1068,7 @@ func cmdAgg(args []string) int {
 
 		keys := make([]string, len(groupIdx))
 		for i, idx := range groupIdx {
-			keys[i] = valueAt(cells, idx)
+			keys[i] = formulaValueAt(cells, rowDerived, idx)
 		}
 		groupKey := strings.Join(keys, "\x1f")
 		group, seen := groups[groupKey]
@@ -902,9 +1081,13 @@ func cmdAgg(args []string) int {
 			order = append(order, groupKey)
 		}
 		group.rows++
+		// A --agg formula is computed from the group's rows once the scan is
+		// over, so each row's values for the columns it reads are kept as they
+		// go past.
+		runner.addRow(group, cells, rowDerived)
 		for _, state := range group.aggs {
 			if state.spec.kind == kindCountDistinct {
-				state.add(0, false, valueAt(cells, state.spec.index))
+				state.add(0, false, formulaValueAt(cells, rowDerived, state.spec.index))
 				continue
 			}
 			value, ok := state.spec.expr.eval(lookup)
@@ -912,19 +1095,52 @@ func cmdAgg(args []string) int {
 		}
 	}
 	if err = iter.Error(); err != nil {
-		return failWithSheet("agg", err, f.GetSheetList(), *pretty)
+		return failWithSheet("agg", err, userSheets(f), *pretty)
 	}
 	if !resolved {
 		// A sheet with no data rows still has to resolve, or a bad column name
 		// would silently produce an empty result instead of an error.
 		if err = resolve(); err != nil {
-			return respondErr("agg", codeColumnNotFound, err.Error(), *pretty, exitUsage)
+			return fail("agg", err, *pretty)
 		}
 	}
 
 	// Sort groups by their key so that the output is stable between runs even
 	// though the map is not.
 	sort.Strings(order)
+
+	// The total each share is a share of, summed from the groups of this same
+	// scan rather than from a second pass over the worksheet: a numerator and
+	// its denominator have to come from one read of the file, or a workbook
+	// edited between two calls is divided by a total that no longer belongs to
+	// it. Summing the groups also makes the shares add up to exactly 1, which a
+	// separately scanned total would not.
+	totals := map[string]float64{}
+	zeroTotals := false
+	if len(sharable) > 0 {
+		accumulators := map[string]*compensatedSum{}
+		for _, name := range sharable {
+			if name == "count" {
+				totals[name] = float64(rowsMatched)
+				continue
+			}
+			accumulators[name] = &compensatedSum{}
+		}
+		for _, groupKey := range order {
+			for _, state := range groups[groupKey].aggs {
+				accumulator, ok := accumulators[state.spec.name]
+				if !ok {
+					continue
+				}
+				if value, has := state.result(); has {
+					accumulator.add(value)
+				}
+			}
+		}
+		for name, accumulator := range accumulators {
+			totals[name] = roundToExcel(accumulator.value())
+		}
+	}
 
 	out := make([]orderedRow, 0, len(order))
 	for _, groupKey := range order {
@@ -948,13 +1164,50 @@ func cmdAgg(args []string) int {
 				row.vals = append(row.vals, nil)
 			}
 		}
+		if runner != nil {
+			results, _, err := runner.run(engine, group)
+			if err != nil {
+				// The formula cannot work for any group, so the command is
+				// rejected with the engine's own message rather than repeated
+				// for every group left.
+				return respondErr("agg", codeUsage, err.Error(), *pretty, exitUsage)
+			}
+			for _, spec := range formulaArgs {
+				row.keys = append(row.keys, spec.name)
+				row.vals = append(row.vals, results[spec.name])
+			}
+		}
 		if *count {
 			row.keys = append(row.keys, "count")
 			row.vals = append(row.vals, group.rows)
 			computed["count"] = float64(group.rows)
 		}
+		if *share {
+			for _, name := range sharable {
+				field := sharePrefix + name
+				row.keys = append(row.keys, field)
+				value, has := computed[name]
+				switch {
+				case !has:
+					// Nothing was aggregated for this group, so there is no part
+					// of the total to report.
+					row.vals = append(row.vals, nil)
+				case totals[name] == 0:
+					zeroTotals = true
+					row.vals = append(row.vals, nil)
+				default:
+					share := roundToExcel(value / totals[name])
+					row.vals = append(row.vals, share)
+					computed[field] = share
+				}
+			}
+		}
 		for _, d := range derives {
 			value, ok := d.expr.eval(func(name string) (float64, bool) {
+				if rest, isTotal := strings.CutPrefix(name, totalPrefix); isTotal {
+					number, found := totals[rest]
+					return number, found
+				}
 				number, found := computed[name]
 				return number, found
 			})
@@ -1041,6 +1294,14 @@ func cmdAgg(args []string) int {
 	}
 	result.Warnings = append(result.Warnings, filterWarnings(filters)...)
 	result.Warnings = append(result.Warnings, formulaWarnings...)
+	result.Warnings = append(result.Warnings, runner.warnings(len(order))...)
+	result.Warnings = append(result.Warnings, derived.warnings()...)
+	if zeroTotals {
+		result.Warnings = append(result.Warnings, fmt.Sprintf(
+			"the total of %s is zero, so its share of it is null rather than a division by "+
+				"nothing; check whether a --where excluded the rows that carried the value",
+			strings.Join(sharable, ", ")))
+	}
 	result.Warnings = append(result.Warnings, columnWarnings(
 		refNames, refPresent, refFilled, refUnits, numericRef, rowsMatched, *calc)...)
 	if nonNumeric > 0 {

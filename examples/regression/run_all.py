@@ -34,6 +34,7 @@ SUITES = [
     ("verify_docs.py", "文档中的命令可执行"),
     ("regress_shapes.py", "真实表格形状（格式/公式/合并/括号列名/文本百分比）"),
     ("regress_round2.py", "第二轮外部复检 15 条（静默错值/分页边界/日期/接口一致性）"),
+    ("regress_round3.py", "第三轮能力（--col 派生列 / --agg 公式聚合 / --share 占比与边界）"),
     ("regress_small.py", "小文件鲁棒性（含加密与损坏文件）"),
     ("serve_mem.py", "serve 会话内存有界"),
 ]

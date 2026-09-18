@@ -48,7 +48,7 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -o bin/xlpeek.exe .
 Behavioural suites (Python 3.7+; not part of `go test`):
 
 ```bash
-python examples/regression/run_all.py     # all twelve suites, ~90s, exit code is the verdict
+python examples/regression/run_all.py     # all thirteen suites, ~110s, exit code is the verdict
 python examples/regression/regress_agg.py # one suite
 XLPEEK=/path/to/xlpeek python run_all.py  # test a specific build
 node examples/nodejs/test.js              # 33 Node-wrapper checks
@@ -97,6 +97,7 @@ the stdlib `flag` package stops at the first positional.
 | `expr.go` | arithmetic expression parser/evaluator shared by `agg` column and derive expressions |
 | `dates.go` | `--dates`: number-format inspection and date serialisation |
 | `serve.go` | the stdio line protocol and `ping` |
+| `formula.go` | `--col` / `--agg`: the formula scanner, the scratch-sheet engine, volatile-function refusal |
 
 ### The output contract (`output.go`)
 
@@ -160,6 +161,18 @@ These are the reason the code looks the way it does; preserve them when editing.
   holds something as "more to fetch", so a formatted-but-empty tail ends the scan instead of
   producing blank pages with `complete: false`. `info --deep`'s `last_populated_row` is the
   position a caller should plan against; `max_row` is the file's own hint.
+- **A formula is evaluated, never written, and never trusted to be stable.** `formula.go` owns
+  the boundary: volatile functions (`NOW`/`TODAY`/`RAND`/`RANDBETWEEN`) are refused because the
+  same command must not answer differently twice; an unsupported function, a misspelled column, a
+  bad sheet reference and an unbalanced formula are all usage errors *before the scan*, because
+  they fail identically on every row; and everything else the engine fails on (`#DIV/0!`,
+  `#VALUE!`, `VLOOKUP no result found`) becomes the cell's value and is counted, since an empty
+  cell and a lookup that found nothing are different facts. Evaluation happens on a scratch
+  worksheet that is created lazily and deleted on the way out — writing into the sheet being read
+  invalidates the row iterator (measured at 3m43s for 2,600 rows against 1.3s), and a sheet left
+  behind would show up in every later sheet list, including `serve`'s cached workbooks.
+  A whole-column reference is allowed but warned about: its cost is the rows evaluated times the
+  rows the range holds.
 
 ### `serve` mode
 
@@ -188,3 +201,21 @@ Every round-2 finding has a case in `examples/regression/regress_round2.py`, whi
 tracked counterpart — when one of those tickets is reopened, extend that suite rather than
 re-running the review by hand. The reports themselves stay untracked because they describe a
 past binary, but the cases they produced are the part worth keeping.
+
+`round3/` (2026-09-17) is the first round that is a **capability request** rather than a defect
+report: expose the excelize formula engine that `--calc` already used, as `--col` (a formula per
+row), `--agg` (a formula per group) and `--share` (a group's part of the total). It ships a
+`xlpeek-feasibility-check/` program that measures the engine's behaviour and cost — the numbers
+in §2 of its request are worth re-running when excelize is upgraded, because the request's
+argument is that the work is cheap and that argument expires with the dependency. Its §3 names
+what it does *not* want: no cross-tab output (the long form is deliberate), no pivot-table or
+chart reading (excelize has no chart getter), and `--sheets` as the lowest priority of the
+optional items. What it asks for in §5 is the part that became the boundary work in
+`regress_round3.py`: volatile functions refused, unimplemented ones named, a failed row
+distinguishable from an empty one.
+
+`bugs/round3/xlpeek-remediation-request-round3.md` also carries the client's own measurements,
+which are optimistic in one place worth knowing about: their 0.02 ms/row for a per-row formula
+was measured without streaming the sheet at the same time and with the formula cell on the same
+worksheet. Through the scratch worksheet, with the row iterator running, it is ~0.3–0.5 ms/row
+(0.7 s for the 2,600-row fixture).

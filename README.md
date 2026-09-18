@@ -95,10 +95,10 @@ covers how it is meant to be *driven*, and how it is checked:
 
 | File | For | Size |
 | --- | --- | --- |
-| [docs/SYSTEM_PROMPT.md](docs/SYSTEM_PROMPT.md) | paste into an agent's system prompt | ~850 tokens |
-| [docs/AGENTS.md](docs/AGENTS.md) | the agent's reference, loaded on demand | ~7,400 tokens |
+| [docs/SYSTEM_PROMPT.md](docs/SYSTEM_PROMPT.md) | paste into an agent's system prompt | ~1,000 tokens |
+| [docs/AGENTS.md](docs/AGENTS.md) | the agent's reference, loaded on demand | ~9,500 tokens |
 | [examples/nodejs](examples/nodejs) | a Node wrapper and the stdio traps it avoids | |
-| [examples/regression](examples/regression) | twelve cross-validation suites, `run_all.py` | |
+| [examples/regression](examples/regression) | thirteen cross-validation suites, `run_all.py` | |
 
 The first two exist because an agent that does not know the traps will walk into
 them confidently — the units-and-currencies case above is not hypothetical, it
@@ -141,7 +141,7 @@ That builds the four targets with the flags above, copies in `testdata/`, the
 suites, the docs and the licence, **runs the whole suite against the assembled
 copies**, and writes a `SHA256SUMS` over everything shipped. Unpack it anywhere
 and `sha256sum -c SHA256SUMS` verifies it; run
-`python examples/regression/run_all.py` inside it and the twelve suites run off
+`python examples/regression/run_all.py` inside it and the thirteen suites run off
 the bundled binary and the bundled fixtures, with nothing to install.
 
 ### Provenance
@@ -175,7 +175,7 @@ table after the envelope, so only the first line parses as JSON.
 ## Testing
 
 ```bash
-go test .            # 51 unit tests
+go test .            # 58 unit tests
 python examples/regression/run_all.py   # the suites below, ~75s
 ```
 
@@ -183,7 +183,7 @@ python examples/regression/run_all.py   # the suites below, ~75s
 [`examples/regression`](examples/regression) cover what unit tests cannot:
 **cross-validation against an independent XML parser**, behaviour on real and
 malformed files, and whether the commands written in these docs actually run.
-Twelve suites, exit code is the verdict:
+Thirteen suites, exit code is the verdict:
 
 | | |
 | --- | --- |
@@ -194,6 +194,7 @@ Twelve suites, exit code is the verdict:
 | `regress_precision` | every difference from the raw XML explained by 15-digit normalisation |
 | `regress_shapes` | the shapes a real report has — ¥/`%` formats, uncached formulas, merged labels, bracketed column names, percentage text |
 | `regress_round2` | one case per finding of the second external review, most of them asserting the *error* |
+| `regress_round3` | the third round's three capabilities, each against a hand-sized sheet, and the boundary: a volatile function refused, an unimplemented one named, a failed row distinguishable from an empty one, and no scratch worksheet left behind |
 | `verify_docs` | every command in docs/AGENTS.md and this file, actually executed |
 | `regress_small` | ten files × seven commands: no panic, valid envelope, no null arrays |
 | `serve_mem` | memory converges over 300 requests |
@@ -217,8 +218,8 @@ Every invocation writes **exactly one JSON envelope to stdout** and nothing
 else. This holds on the failure path too, so a caller has a single parse path.
 
 ```json
-{"ok":true,"command":"read","version":"1.0.3","data":{ ... }}
-{"ok":false,"command":"read","version":"1.0.3","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
+{"ok":true,"command":"read","version":"1.1.0","data":{ ... }}
+{"ok":false,"command":"read","version":"1.1.0","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
 ```
 
 Exit codes: `0` success, `1` runtime failure, `2` usage failure. The distinction
@@ -233,8 +234,8 @@ stderr is human-oriented noise, such as the flag package's own diagnostics.
 call, and it carries the copyright alongside the number:
 
 ```json
-{"ok":true,"command":"version","version":"1.0.3",
- "data":{"name":"xlpeek","version":"1.0.3",
+{"ok":true,"command":"version","version":"1.1.0",
+ "data":{"name":"xlpeek","version":"1.1.0",
          "copyright":"Copyright (c) 2026 henryyu@163.com. All rights reserved."}}
 ```
 
@@ -348,6 +349,7 @@ xlpeek read book.xlsx -s 明细 --header --fill-merged            # merge-aware
 xlpeek read book.xlsx -s 明细 --header --format tsv -l 500      # cheaper than JSON
 xlpeek read book.xlsx -s 明细 --header --columns "A:D" -l 100   # a range, not a list
 xlpeek read book.xlsx -s 明细 --header --dates iso -l 100       # stable dates
+xlpeek read book.xlsx -s 明细 --header --col "净利=收入金额-成本金额" --columns "客户名称,净利"
 xlpeek read book.xlsx -s 0 -l 1                                 # sheet by index
 xlpeek read book.xlsx -s 明细 --header --format csv -l 100
 xlpeek read book.xlsx -s 明细 --header --format markdown -l 100
@@ -429,11 +431,20 @@ xlpeek agg book.xlsx -s 明细 --header --sum "净利=收入金额-成本金额"
 # Filter first.
 xlpeek agg book.xlsx -s 明细 --header --where "销售区域=华北" --sum 收入金额
 
+# A trend by month: derive the period from the date column, then group by it.
+xlpeek agg book.xlsx -s 明细 --header --col "月=MONTH(过账日期)" --group-by 月 --sum 收入金额
+
+# A median the outlier cannot move, and a share of the whole.
+xlpeek agg book.xlsx -s 明细 --header --group-by 分部 --sum 收入金额 --count --share \
+    --agg "中位金额=MEDIAN(收入金额)" --agg "p90=PERCENTILE(收入金额,0.9)"
+
 # A workbook written by a script: its formulas have no cached value.
 xlpeek agg book.xlsx -s 明细 --header --sum 收入金额 --calc
 ```
 
-Aggregates: `--sum`, `--avg`, `--min`, `--max`, `--count`, `--count-distinct`.
+Aggregates: `--sum`, `--avg`, `--min`, `--max`, `--count`, `--count-distinct`,
+`--agg` (any Excel formula, over the group's rows) — plus `--share` for the
+percentage of the total.
 Each accepts an arithmetic expression over columns (`+ - * /`, parentheses), and
 a leading `name=` renames the output field. Every one is repeatable. A column
 whose name contains an operator, a bracket or a space is written in brackets —
@@ -490,6 +501,146 @@ to `sum_收入` is a usage error — one the message will tell you how to fix.
   into every row it spans. Both make excelize load the whole worksheet, so
   neither is on by default.
 
+#### `--share` — this group's part of the whole
+
+```bash
+xlpeek agg book.xlsx -s 明细 --header --group-by 结算方式 --sum 收入金额 --count --share
+```
+
+```json
+{"结算方式":"信用证","sum_收入金额":659101283.13,"count":668,
+ "share_sum_收入金额":0.253620782765361,"share_count":0.256923076923077}
+```
+
+One `share_<field>` per summed field and for `count`, as a fraction rather than
+a percentage, so `share_count` summing to 1 across the groups is a check the
+caller can run. The total comes from the same scan that produced the groups —
+never from a second query — so a workbook edited in between cannot be divided by
+a total it no longer has, and a `--where` narrows the total exactly as it
+narrows the groups. The same number is reachable from `--derive` as
+`_total_<field>`:
+
+```bash
+xlpeek agg book.xlsx -s 明细 --header --group-by 结算方式 --sum 收入金额 \
+    --derive "占比=sum_收入金额/_total_sum_收入金额"
+```
+
+Only additive fields have a share: `--avg`, `--min`, `--max`, `--count-distinct`
+and `--agg` are not parts of a total, and asking for `--share` with none of
+`--sum`/`--count` in the command is a usage error rather than a column of
+nonsense. A zero total gives `null` and a warning, not a division.
+
+### `--col` and `--agg` — the workbook's own formula engine
+
+Both commands can hand a formula to the engine excelize already carries — the
+one `--calc` uses to fill in a formula cell that has no cached result. A formula
+is written the way a spreadsheet user writes it, with column names instead of
+cell addresses:
+
+```bash
+# A period derived from a date column, then grouped.
+xlpeek agg book.xlsx -s 明细 --header --col "月=MONTH(过账日期)" --group-by 月 --sum 收入金额
+
+# A unit and currency conversion, as a row-level calculation.
+xlpeek agg book.xlsx -s 明细 --header \
+    --col "金额CNY=收入金额*IF(单位=\"千元\",1000,1)*IF(币种=\"USD\",7.2043,1)" \
+    --group-by 结算方式 --sum 金额CNY
+
+# Text cleaned before it is grouped.
+xlpeek agg book.xlsx -s 明细 --header --col "干净备注=TRIM(SUBSTITUTE(备注,\" \",\"\"))" \
+    --group-by 干净备注 --count
+
+# A lookup into another sheet — free, because it is just a formula.
+# Bound the lookup range: it is re-scanned for every row (see below).
+xlpeek agg book.xlsx -s 明细 --header \
+    --col "目标=VLOOKUP(客户编号,目标表!$A$1:$B$100,2,FALSE)" \
+    --group-by 客户编号 --sum 收入金额 --avg 目标
+
+# Distribution and conditional counts, per group.
+xlpeek agg book.xlsx -s 明细 --header --group-by 分部 \
+    --agg "中位金额=MEDIAN(收入金额)" --agg "p90=PERCENTILE(收入金额,0.9)" \
+    --agg "超标单数=COUNTIFS(收入金额,\">100000\",销售区域,\"华东\")" \
+    --agg "离散系数=STDEV(收入金额)/AVERAGE(收入金额)"
+
+# The same derived column on a page of rows.
+xlpeek read book.xlsx -s 明细 --header --col "月=MONTH(过账日期)" \
+    --columns "凭证号,月" --where "月=3"
+```
+
+- **`--col "name=FORMULA"`** (`agg` and `read`, repeatable) computes a column
+  per row. The result is a column like any other: `--group-by 月`, `--where 月=3`,
+  `--sort-by 月`, `--sum 月`, and `--agg` may all name it, and a later `--col`
+  may read it. In `read` it appears after the sheet's own columns, is listed in
+  `header` and `derived_columns`, and can be projected with `--columns`.
+- **`--agg "name=FORMULA"`** (`agg`, repeatable) computes one value per group
+  over that group's rows. It sits beside `--sum` and friends — the existing
+  flags are the common cases, this is the rest of the engine — and `--derive`
+  works on its result like any other field.
+- **A header row is required** for `--col` (`--header` or `--header-row N`),
+  because a derived column is referred to by name and a sheet read without a
+  header row has no names. A derived column may not be called something that is
+  already a column of the sheet, or a column letter (`B`), an index (`2`) or a
+  cell reference (`A1`): every later reference to it would otherwise be
+  ambiguous, and the ambiguity would be silent.
+- **The formula sees the values the file stores**, not the ones `--raw` or
+  `--dates` render — a formula is evaluated by the engine against the worksheet,
+  not against this tool's output. A column holding text dates is therefore
+  directly usable: `MONTH(过账日期)` works on a cell holding `"2023-05-02"`,
+  because the engine coerces it, while a column holding something else (`MONTH(客户名称)`)
+  gives `#VALUE!` rather than a silent 0. To the engine, `12.35%` is text: the
+  `--sum` tolerance for formatted numbers is not applied to a formula's inputs.
+- **Cross-sheet references work as written and cost what they cost.** `目标表!$A:$B`
+  is passed through untouched, which is what makes `VLOOKUP` free rather than a
+  feature of its own; `--col` and `--agg` only rewrite the names that resolve to
+  columns of the sheet being read. Referencing a sheet that does not exist is a
+  usage error naming the sheets that do. **Bound a lookup range**: the cost of a
+  reference is the rows the formula is evaluated over times the rows the range
+  holds, so `VLOOKUP(x,目标表!$A:$B,2,FALSE)` re-scans the whole column for every
+  row — 44 s for 2,700 rows against a 2,700-row column, and 0.8 s for the same
+  lookup against `$A$1:$B$100` — and the response says so in `warnings` when a
+  formula reads whole columns, because a 44-second command reads as a hang.
+- **Volatile functions are refused.** `NOW`, `TODAY`, `RAND` and `RANDBETWEEN`
+  are evaluated silently by the engine, so a command containing one answers a
+  different question every time it runs — which is worse than not supporting it
+  in a tool whose output is used to reconcile figures. The error names the
+  function; filter on a date column, or pass the constant in the command.
+- **A function the engine does not implement says so once.** `QUARTER` is the
+  one an office report reaches for that is absent (write
+  `ROUNDUP(MONTH(d)/3,0)`); a misspelled column or a malformed formula is
+  caught before the scan rather than once per row, and exits 2 with the engine's
+  own message.
+- **A column that held nothing is named, not summed.** A formula whose cached
+  result was never written — what openpyxl, pandas and xlsxwriter produce — reads
+  as an empty cell, and the engine answers `SUM` over it with `0`: a number, and
+  the wrong one to pass on quietly. A column an `--agg` reads that held nothing
+  in any matched row says so and points at `--calc`, exactly as `--sum` does, and
+  with `--calc` the same aggregate returns the computed total. A `--col` formula
+  needs no `--calc` for this: it reads through the engine, which evaluates the
+  formula cell it references.
+- **A row the engine cannot compute is data.** `#DIV/0!`, `#VALUE!`, `#NUM!`
+  and `VLOOKUP no result found` become the cell's value — an empty cell and a
+  lookup that found nothing are different facts — and are counted per column in
+  `warnings` (`--col`) or per formula in `warnings` (`--agg`, where such a group
+  reports `null`).
+- **Evaluation costs time and memory.** Both flags add roughly 0.3–0.5 ms per
+  row to the scan, because each row is evaluated through the engine; a `--col`
+  over 2,600 rows measures at about 0.7 s against 0.15 s without it, and `--agg`
+  is 0.7 s whether the grouping produces 65 groups or 2,600, since every group is
+  evaluated before the output is paged. Both also give up the streaming profile
+  the way `--calc` does — the engine holds the worksheet in memory — and `--agg`
+  keeps each group's values for the columns its formulas read until the scan
+  ends, so the memory a run needs is proportional to the columns it reads.
+  Nothing is written to the workbook: the formula and the group's values live on
+  a scratch worksheet that is created on first use, removed before the command
+  returns — failure paths included — and hidden from every sheet list in the
+  response.
+
+> **The output stays long-format.** `--group-by 分部,结算方式` returns one row per
+> combination, not a matrix with one dimension across the top: a caller parsing
+> the result needs a fixed schema, and a cross-tab's column count is decided by
+> the data. Transposing it is a rendering decision, and it belongs to whoever is
+> rendering.
+
 ### `profile` — what does each column actually contain?
 
 Runs a full scan and reports, per column: inferred type, fill rate, distinct
@@ -527,6 +678,13 @@ know that some rows will not parse. Distinct tracking is capped (20,000 per
 column, 500,000 in total) and a column that exceeds it reports
 `distinct_capped: true`, so its distinct count is a lower bound rather than a
 memory problem.
+
+**`type` is the *usable* type, not the stored one.** `date` means the values can
+be used as dates — compared, sorted, and passed to `MONTH` and the rest through
+`--col` — and a column of dates held as text is `date` for exactly that reason.
+It does not mean the cell stores a date: `--raw` on the same column returns the
+string `"2023-05-02"` rather than a serial number, and a caller checking storage
+types should read that instead of the profile.
 
 **Profile before aggregating.** It is the cheapest way to find the columns whose
 values are not comparable — mixed units, mixed currencies, negative amounts in a
@@ -687,7 +845,9 @@ xlpeek read report.xlsx -s Sheet1 --header-row 3
 ```
 
 `--header-row 0` means there is no header, and columns are addressed by letter or
-index.
+index. `--col` needs a header row for a different reason — a derived column is
+referred to by name, and a name needs a row of names — and says so rather than
+guessing a position.
 
 ## Merged cells
 
@@ -792,5 +952,14 @@ with embedded line breaks would otherwise corrupt the table.
 
 ## Not implemented
 
-The tool is read-only by design. Writing, formula *setting*, charts, images,
-pivot tables, conditional formatting and style inspection are out of scope.
+The tool is read-only by design. It can *evaluate* a formula the workbook
+already carries — `--calc` fills in a formula cell with no cached result, and
+`--col` / `--agg` run one — but it never sets one, and nothing is written to the
+file: the scratch worksheet the engine needs is created on first use and removed
+before the command returns.
+
+Charts, images and conditional formatting are out of scope because excelize can
+create them but exposes no getter, so there is nothing to read. Cell styles and
+pivot-table definitions are readable in principle and are not implemented here.
+A cross-tab or pivot *layout* is deliberately not offered: `agg` returns the long
+form, one row per dimension combination, which is the shape a parser can rely on.
