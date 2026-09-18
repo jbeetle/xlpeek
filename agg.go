@@ -855,12 +855,13 @@ func cmdAgg(args []string) int {
 			ctx.flag = "agg"
 			specs := make([]*formulaAgg, len(formulaArgs))
 			for i := range formulaArgs {
-				ctx.broadRefs = nil
+				ctx.broadRefs, ctx.misused = nil, nil
 				if formulaArgs[i].parts, err = scanFormula(formulaArgs[i].source, ctx); err != nil {
 					return usageFailure(err)
 				}
 				formulaArgs[i].cols = formulaArgs[i].parts.columns()
 				formulaArgs[i].broadRefs = ctx.broadRefs
+				formulaArgs[i].misused = ctx.misused
 				specs[i] = &formulaArgs[i]
 			}
 			runner = newFormulaAggRunner(specs, header)

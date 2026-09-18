@@ -1460,3 +1460,35 @@ func TestScratchValueReadsNumbersTheWaySumDoes(t *testing.T) {
 		}
 	}
 }
+
+func TestScanFormulaReportsRiskyRangeCalls(t *testing.T) {
+	// NPV is right about scalar arguments and wrong about a range: it discounts
+	// only the first cell. A per-group formula hands it a range, a per-row one a
+	// single cell, so only the first is worth reporting.
+	cases := []struct {
+		flag    string
+		formula string
+		want    string
+	}{
+		{"agg", "NPV(0.1,现金流)", "NPV"},
+		{"agg", "SUM(现金流)+NPV(0.1,现金流)", "NPV"},
+		{"agg", "NPV(0.1,-1000,1000,2000)", ""},
+		{"agg", "NPV(0.1,现金流)+NPV(0.1,现金流)", "NPV"}, // reported once
+		{"col", "NPV(0.1,现金流)", ""},
+	}
+	for _, test := range cases {
+		ctx := &formulaContext{
+			header: []string{"项目", "现金流"},
+			sheets: []string{"明细"},
+			flag:   test.flag,
+		}
+		if _, err := scanFormula(test.formula, ctx); err != nil {
+			t.Errorf("scanFormula(%q): %v", test.formula, err)
+			continue
+		}
+		if got := strings.Join(ctx.misused, ","); got != test.want {
+			t.Errorf("scanFormula(%q) flag=%s misused = %q, want %q",
+				test.formula, test.flag, got, test.want)
+		}
+	}
+}

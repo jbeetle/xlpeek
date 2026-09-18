@@ -48,6 +48,19 @@ var volatileFunctions = map[string]string{
 	"RANDBETWEEN": "a random number",
 }
 
+// riskyRangeFunctions name the engine functions that silently mishandle a
+// range argument. They are not refused — the caller may well be using them
+// correctly — but a formula that hands one a column of the sheet is warned
+// about, because the number it produces looks like an answer.
+//
+// Verified against excelize 2.11.0: NPV iterates its arguments and calls
+// ToNumber on each, so a range collapses to its first cell. IRR, XIRR, XNPV,
+// PMT, PV and FV were checked at the same time and read their arguments
+// correctly.
+var riskyRangeFunctions = map[string]string{
+	"NPV": "the engine discounts only the first cell of a range",
+}
+
 // scratchPrefix names the worksheets this tool adds to a workbook in order to
 // evaluate a formula. They are deleted before the command returns, and hidden
 // from every message that lists the workbook's sheets — a caller told to pick
@@ -86,6 +99,13 @@ type formulaPart struct {
 // formulaParts is a scanned formula, ready to be rendered once per row or once
 // per group.
 type formulaParts []formulaPart
+
+// riskCall is the span of one call to a function that mishandles a range,
+// measured on the formula as written.
+type riskCall struct {
+	name       string
+	start, end int
+}
 
 // columns lists the columns the formula reads, in the order they first appear
 // and without repeats, so that each can be resolved once.
@@ -135,6 +155,10 @@ type formulaContext struct {
 	// makes, so that the command can warn about what they cost. The caller
 	// empties it before each scan.
 	broadRefs []string
+	// misused names the risky functions the formula called over a column of this
+	// sheet. Only a formula evaluated per group collects them: there a column
+	// becomes a range, which is the argument the engine mishandles.
+	misused []string
 }
 
 // column resolves a name written in a formula to a column index. Derived
@@ -229,6 +253,12 @@ func scanFormula(formula string, ctx *formulaContext) (formulaParts, error) {
 	var (
 		parts   formulaParts
 		literal strings.Builder
+		// refAt records where each column reference was written, and riskyCalls
+		// the span of every call to a function that mishandles a range. Together
+		// they answer "did this formula hand a column to NPV", which a per-group
+		// formula must not do quietly.
+		refAt     []int
+		riskCalls []riskCall
 	)
 	flush := func() {
 		if literal.Len() > 0 {
@@ -236,8 +266,9 @@ func scanFormula(formula string, ctx *formulaContext) (formulaParts, error) {
 			literal.Reset()
 		}
 	}
-	addColumn := func(idx int) {
+	addColumn := func(idx int, at int) {
 		flush()
+		refAt = append(refAt, at)
 		parts = append(parts, formulaPart{ref: idx, isRef: true})
 	}
 	unknownName := func(name string) error {
@@ -279,7 +310,7 @@ func scanFormula(formula string, ctx *formulaContext) (formulaParts, error) {
 			}
 			name := strings.TrimSpace(formula[i+1 : i+1+end])
 			if idx, ok := ctx.bracketed(name); ok {
-				addColumn(idx)
+				addColumn(idx, i)
 			} else {
 				literal.WriteString(formula[i : i+1+end+1])
 			}
@@ -350,9 +381,16 @@ func scanFormula(formula string, ctx *formulaContext) (formulaParts, error) {
 				// name before the word is taken as a function.
 				if end := closingParen(formula, next); end > 0 {
 					if idx, ok := ctx.bracketed(formula[i:end]); ok {
-						addColumn(idx)
+						addColumn(idx, i)
 						i = end
 						continue
+					}
+				}
+				if _, risky := riskyRangeFunctions[strings.ToUpper(word)]; risky {
+					if end := closingParen(formula, next); end > 0 {
+						riskCalls = append(riskCalls, riskCall{
+							name: strings.ToUpper(word), start: next, end: end,
+						})
 					}
 				}
 				if what, ok := volatileFunctions[strings.ToUpper(word)]; ok {
@@ -385,7 +423,7 @@ func scanFormula(formula string, ctx *formulaContext) (formulaParts, error) {
 					if !ok {
 						return reject("%s", unknownName(word))
 					}
-					addColumn(idx)
+					addColumn(idx, i)
 				}
 				i = end
 			}
@@ -395,6 +433,25 @@ func scanFormula(formula string, ctx *formulaContext) (formulaParts, error) {
 		}
 	}
 	flush()
+	// A per-group formula turns a column reference into a range, which is the
+	// argument these functions mishandle; a per-row formula turns it into a
+	// single cell, where there is nothing to collapse. Only the first case is
+	// worth a warning, so only the first is collected.
+	if ctx.flag == "agg" {
+		seen := map[string]bool{}
+		for _, call := range riskCalls {
+			if seen[call.name] {
+				continue
+			}
+			for _, at := range refAt {
+				if at > call.start && at < call.end {
+					seen[call.name] = true
+					ctx.misused = append(ctx.misused, call.name)
+					break
+				}
+			}
+		}
+	}
 	return parts, nil
 }
 
@@ -1027,6 +1084,20 @@ func (d *derivedSet) warnings() []string {
 	return out
 }
 
+// misusedWarning says what a call the engine gets wrong actually computed.
+//
+// It is not a refusal: the caller may know exactly what they are doing, and the
+// function is right when its arguments are scalars. What it is not allowed to
+// be is silent, because the number it returns looks like an answer.
+func misusedWarning(flag, name string, funcs []string) string {
+	return fmt.Sprintf(
+		"%s %q calls %s over a column, and the engine discounts only the first cell of a range: "+
+			"measured on [-1000,1000,2000] at 10%%, NPV returned -909.09 where the correct value is "+
+			"1419.98; write the values out as separate arguments, use XNPV with --raw dates, or "+
+			"discount the column outside the tool",
+		flag, name, strings.Join(funcs, ", "))
+}
+
 // broadRefWarning says what a whole-column reference costs. It is not a
 // correctness warning: the answer is right, it simply
 // costs the rows evaluated times the rows the range holds, which reads as a
@@ -1058,8 +1129,10 @@ type formulaAgg struct {
 	parts  formulaParts
 	// cols are the columns it reads, in first-use order.
 	cols []int
-	// broadRefs are the whole-column references the formula makes.
+	// broadRefs are the whole-column references the formula makes, and misused
+	// names the risky functions it called over a column.
 	broadRefs []string
+	misused   []string
 }
 
 // formulaAggRunner evaluates every --agg formula against each group.
@@ -1121,6 +1194,11 @@ func (r *formulaAggRunner) warnings(groups int) []string {
 		return nil
 	}
 	var out []string
+	for _, spec := range r.specs {
+		if len(spec.misused) > 0 {
+			out = append(out, misusedWarning("--agg", spec.name, spec.misused))
+		}
+	}
 	for slot, name := range r.names {
 		// A column that held nothing is what an uncached formula looks like, and
 		// the engine answers SUM over it with 0 — a number, and a wrong one to

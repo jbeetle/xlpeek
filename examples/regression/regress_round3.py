@@ -258,6 +258,16 @@ check('加 --calc 后算出真值', [r.get('合计') for r in rows(env)], [44])
 rc, env = run('agg', SHAPES, '-s', '公式', '--header', '--col', '含税=金额*1.13', '--sum', '含税', '--count')
 check('--col 在无缓存公式列上可用', [r.get('sum_含税') for r in rows(env)], [49.72])
 
+# 引擎的 NPV 对区域参数只取首格：值照旧给出（那是引擎的答案），但必须出声。
+rc, env = run('agg', FILE, '-s', '公式', '--header', '--group-by', '部门',
+              '--agg', '现值=NPV(0.1,金额)', '--count')
+check('NPV 给区域参数时告警',
+      len([w for w in (data(env).get('warnings') or []) if 'NPV' in w]), 1)
+rc, env = run('agg', FILE, '-s', '公式', '--header', '--group-by', '部门',
+              '--agg', '现值=NPV(0.1,100,110,120)', '--count')
+check('NPV 逐个参数时不告警',
+      [w for w in (data(env).get('warnings') or []) if 'NPV' in w], [])
+
 rejects('--agg 要求 name=formula',
         ['agg', FILE, '-s', '公式', '--header', '--agg', 'MEDIAN(金额)'])
 

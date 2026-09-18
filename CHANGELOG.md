@@ -6,7 +6,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [1.1.0] - 2026-09-17
+## [1.1.0] - 2026-09-18
 
 The third external review was a capability request rather than a defect report:
 the workbook's own formula engine was already wired in for `--calc`, and the
@@ -69,6 +69,13 @@ gap it fills.
   `--calc` is the fix on both. A `--col` formula needs no `--calc` for this, and
   that is documented rather than left to be discovered: it reads through the
   engine, which evaluates the formula cell it references.
+- **A function the engine gets wrong is named when it is handed a column.**
+  `NPV(0.1,列)` discounts only the first cell of the range — measured at -909.09
+  on `[-1000,1000,2000]`, where 1419.98 is correct — and the engine returns that
+  number without complaint. An `--agg` formula that does this now says so and
+  names the ways out; the same call with separate arguments is correct and stays
+  silent. `IRR`, `XIRR`, `XNPV`, `PMT`, `PV` and `FV` were verified at the same
+  time and read their arguments correctly.
 - **A row the engine cannot compute is data, and says so.** `#DIV/0!`,
   `#VALUE!`, `#NUM!` and `VLOOKUP no result found` are passed through as the
   cell's value — an empty cell and a lookup that found nothing are different

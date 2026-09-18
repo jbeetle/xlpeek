@@ -609,6 +609,14 @@ xlpeek read book.xlsx -s 明细 --header --col "月=MONTH(过账日期)" \
   `ROUNDUP(MONTH(d)/3,0)`); a misspelled column or a malformed formula is
   caught before the scan rather than once per row, and exits 2 with the engine's
   own message.
+- **A call the engine gets wrong is reported, not refused.** `NPV` iterates its
+  arguments and reads only the first cell of a *range*, so `NPV(0.1,列)` returns
+  the first row discounted — measured at -909.09 on `[-1000,1000,2000]` where the
+  correct value is 1419.98 — while `NPV(0.1,-1000,1000,2000)` is right. A
+  per-group formula that hands it a column says so and names the ways out:
+  separate arguments, `XNPV` with `--raw` dates, or discounting outside the tool.
+  `IRR`, `XIRR`, `XNPV`, `PMT`, `PV` and `FV` were checked at the same time and
+  read their arguments correctly.
 - **A column that held nothing is named, not summed.** A formula whose cached
   result was never written — what openpyxl, pandas and xlsxwriter produce — reads
   as an empty cell, and the engine answers `SUM` over it with `0`: a number, and
