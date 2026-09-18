@@ -28,8 +28,8 @@
 每次调用往 stdout 写且只写一个 JSON：
 
 ```json
-{"ok":true,"command":"read","version":"1.1.0","data":{ ... }}
-{"ok":false,"command":"read","version":"1.1.0","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
+{"ok":true,"command":"read","version":"1.2.0","data":{ ... }}
+{"ok":false,"command":"read","version":"1.2.0","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
 ```
 
 - **错误也在 stdout**，所以只有一个解析路径。先看 `ok`。
