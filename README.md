@@ -219,8 +219,8 @@ Every invocation writes **exactly one JSON envelope to stdout** and nothing
 else. This holds on the failure path too, so a caller has a single parse path.
 
 ```json
-{"ok":true,"command":"read","version":"1.2.0","data":{ ... }}
-{"ok":false,"command":"read","version":"1.2.0","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
+{"ok":true,"command":"read","version":"1.2.1","data":{ ... }}
+{"ok":false,"command":"read","version":"1.2.1","error":{"code":"SHEET_NOT_FOUND","message":"..."}}
 ```
 
 Exit codes: `0` success, `1` runtime failure, `2` usage failure. The distinction
@@ -235,8 +235,8 @@ stderr is human-oriented noise, such as the flag package's own diagnostics.
 call, and it carries the copyright alongside the number:
 
 ```json
-{"ok":true,"command":"version","version":"1.2.0",
- "data":{"name":"xlpeek","version":"1.2.0",
+{"ok":true,"command":"version","version":"1.2.1",
+ "data":{"name":"xlpeek","version":"1.2.1",
          "copyright":"Copyright (c) 2026 henryyu@163.com. All rights reserved."}}
 ```
 

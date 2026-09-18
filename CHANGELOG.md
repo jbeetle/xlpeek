@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-09-18
+
+A documentation fix, and nothing else: the envelope examples in
+`docs/AGENTS.md` still showed version `1.1.0` after 1.2.0 shipped, which is the
+first thing anyone checking a delivery looks at. No command behaves differently
+and no output field changed — the binaries differ from 1.2.0's only because the
+version string is compiled into them.
+
 ## [1.2.0] - 2026-09-18
 
 The first release that comes from our own review rather than a client finding.
@@ -345,7 +353,8 @@ Behaviour aimed at a caller that cannot see the data itself:
 - Error codes distinguish `PASSWORD_REQUIRED` from `INVALID_PASSWORD`, and name
   the available sheets or columns so a caller can correct itself in one step.
 
-[Unreleased]: https://github.com/jbeetle/xlpeek/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/jbeetle/xlpeek/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/jbeetle/xlpeek/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/jbeetle/xlpeek/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/jbeetle/xlpeek/compare/v1.0.3...v1.1.0
 [1.0.3]: https://github.com/jbeetle/xlpeek/compare/v1.0.2...v1.0.3
